@@ -1,0 +1,21 @@
+[package]
+name = "och"
+version = "0.1.0"
+edition = "2021"
+description = "OCH authenticated encryption (Areion-based) — reference Rust implementation"
+license = "CC0-1.0"
+
+[lib]
+name = "och"
+crate-type = ["staticlib", "rlib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[dependencies]
+
+[lints.rust]
+# `och_asm` is set by build.rs after the perlasm step succeeds.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(och_asm)'] }

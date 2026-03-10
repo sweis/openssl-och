@@ -1,0 +1,20 @@
+# OCH authenticated encryption (Areion-based) — Rust-backed implementation.
+#
+# The core is written in Rust (crypto/och/rust/, producing liboch.a), with
+# a thin C API declared in crypto/och/och.h. OpenSSL's Configure does not
+# currently drive a Rust toolchain, so building the staticlib is handled by
+# crypto/och/Makefile out-of-band:
+#
+#     make -C crypto/och rust          # builds rust/target/release/liboch.a
+#
+# To link liboch.a into libcrypto, add to the top-level Configure:
+#
+#     push @{$config{ex_libs}}, File::Spec->rel2abs("crypto/och/rust/target/release/liboch.a");
+#
+# and add `och` to the `crypto` subdirectory list in crypto/build.info. Once
+# wired, the SOURCE[] line below becomes the single glue point; until then the
+# adjacent Makefile builds a standalone benchmark against system libcrypto.
+#
+# LIBS=../../libcrypto
+# SOURCE[../../libcrypto]=
+# DEPEND[../../libcrypto]=rust/target/release/liboch.a
