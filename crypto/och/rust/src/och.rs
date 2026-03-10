@@ -83,6 +83,116 @@ fn ntz(x: u32) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// 4-way block processing — ASM fast path when available, scalar fallback
+// otherwise. The seal/open main loops call `em_encrypt_blocks` /
+// `em_decrypt_blocks` for as many full 32-byte blocks as remain, updating
+// the running offset and checksum as they go.
+
+/// Process `nblocks` full blocks (encrypt direction), writing to `dst`.
+/// - `off` / `i` are the running offset and block counter on entry and are
+///   updated on return to point past the last block consumed.
+/// - `checksum` accumulates the XOR of the first 128 bits of each plaintext
+///   block *before* encryption (matching the reference).
+///
+/// The ASM path dispatches once to a full-loop kernel (offset chain,
+/// checksum, 4× EM all in-ASM). Remainder blocks (<4) use the scalar path.
+#[inline]
+fn em_encrypt_blocks(
+    l: &[U256; L_TABLE_SIZE],
+    off: &mut U256,
+    i: &mut u32,
+    checksum: &mut [u8; 16],
+    src: &[u8],
+    dst: &mut [u8],
+    nblocks: usize,
+) {
+    debug_assert!(src.len() >= 32 * nblocks);
+    debug_assert!(dst.len() >= 32 * nblocks);
+
+    let mut k = 0usize;
+
+    #[cfg(och_asm)]
+    {
+        let n4 = nblocks & !3;
+        if n4 > 0 {
+            crate::asm::em_enc_bulk(
+                &mut dst[..32 * n4],
+                &src[..32 * n4],
+                n4,
+                &l[..],
+                off,
+                i,
+                checksum,
+            );
+            k = n4;
+        }
+    }
+
+    while k < nblocks {
+        let mut pi = [0u8; 32];
+        pi.copy_from_slice(&src[32 * k..32 * k + 32]);
+        for j in 0..16 {
+            checksum[j] ^= pi[j];
+        }
+        *off = xor256(off, &l[ntz(*i)]);
+        let mut ci = pi;
+        em_encrypt(off, &mut ci);
+        dst[32 * k..32 * k + 32].copy_from_slice(&ci);
+        *i += 1;
+        k += 1;
+    }
+}
+
+/// Decrypt direction — checksum accumulates first 128 bits of each recovered
+/// plaintext block *after* decryption.
+#[inline]
+fn em_decrypt_blocks(
+    l: &[U256; L_TABLE_SIZE],
+    off: &mut U256,
+    i: &mut u32,
+    checksum: &mut [u8; 16],
+    src: &[u8],
+    dst: &mut [u8],
+    nblocks: usize,
+) {
+    debug_assert!(src.len() >= 32 * nblocks);
+    debug_assert!(dst.len() >= 32 * nblocks);
+
+    let mut k = 0usize;
+
+    #[cfg(och_asm)]
+    {
+        let n4 = nblocks & !3;
+        if n4 > 0 {
+            crate::asm::em_dec_bulk(
+                &mut dst[..32 * n4],
+                &src[..32 * n4],
+                n4,
+                &l[..],
+                off,
+                i,
+                checksum,
+            );
+            k = n4;
+        }
+    }
+
+    while k < nblocks {
+        let mut ci = [0u8; 32];
+        ci.copy_from_slice(&src[32 * k..32 * k + 32]);
+        *off = xor256(off, &l[ntz(*i)]);
+        let mut pi = ci;
+        em_decrypt(off, &mut pi);
+        for j in 0..16 {
+            checksum[j] ^= pi[j];
+        }
+        dst[32 * k..32 * k + 32].copy_from_slice(&pi);
+        *i += 1;
+        k += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // OCT-256 precomputed state (OCB3-style L table)
 
 struct OctState {
@@ -414,32 +524,29 @@ pub fn seal(
     let mut n_offset = ctx.oct.init_offset(&nfull);
     n_offset = xor256(&n_offset, &ctx.oct.l[0]);
 
-    // Write first ciphertext block (look-ahead pattern from reference).
-    let mut pending_ci = c1;
+    // Write first ciphertext block. (Reference uses a one-block look-ahead
+    // to guard against src/dst aliasing; Rust's borrow checker already
+    // forbids that aliasing, so we write c1 straight away and process the
+    // remainder in bulk.)
+    ct[ct_off..ct_off + 32].copy_from_slice(&c1);
+    ct_off += 32;
 
-    // Process full blocks.
-    while msg_off + 32 <= msg.len() {
-        let mut pi = [0u8; 32];
-        pi.copy_from_slice(&msg[msg_off..msg_off + 32]);
-        // flush pending
-        ct[ct_off..ct_off + 32].copy_from_slice(&pending_ci);
-        ct_off += 32;
-        msg_off += 32;
-
-        for j in 0..16 {
-            checksum[j] ^= pi[j];
-        }
-        n_offset = xor256(&n_offset, &ctx.oct.l[ntz(i)]);
-        let mut ci = pi;
-        em_encrypt(&n_offset, &mut ci);
-        pending_ci = ci;
-        i += 1;
-    }
+    // Bulk full blocks on n_offset.
+    let nblocks = (msg.len() - msg_off) / 32;
+    em_encrypt_blocks(
+        &ctx.oct.l,
+        &mut n_offset,
+        &mut i,
+        &mut checksum,
+        &msg[msg_off..msg_off + 32 * nblocks],
+        &mut ct[ct_off..ct_off + 32 * nblocks],
+        nblocks,
+    );
+    msg_off += 32 * nblocks;
+    ct_off += 32 * nblocks;
 
     // No partial block?
     if msg_off == msg.len() {
-        ct[ct_off..ct_off + 32].copy_from_slice(&pending_ci);
-        ct_off += 32;
         let tag = compute_tag_no_partial(
             ctx,
             msg.len(),
@@ -457,10 +564,6 @@ pub fn seal(
     let mut ext_chk = [0u8; 32];
     ext_chk[..16].copy_from_slice(&checksum);
     let ext_chk_len = if pstar_len > 16 { pstar_len } else { 16 };
-
-    // flush last full ciphertext block
-    ct[ct_off..ct_off + 32].copy_from_slice(&pending_ci);
-    ct_off += 32;
 
     // Pad encryption
     n_offset = xor256(&n_offset, &ctx.oct.lstar);
@@ -575,20 +678,19 @@ pub fn open(
     let mut n_offset = ctx.oct.init_offset(&nfull);
     n_offset = xor256(&n_offset, &ctx.oct.l[0]);
 
-    while ct_off + 32 <= ctcore_len {
-        let mut ci = [0u8; 32];
-        ci.copy_from_slice(&ct[ct_off..ct_off + 32]);
-        ct_off += 32;
-        n_offset = xor256(&n_offset, &ctx.oct.l[ntz(i)]);
-        let mut pi = ci;
-        em_decrypt(&n_offset, &mut pi);
-        for j in 0..16 {
-            checksum[j] ^= pi[j];
-        }
-        i += 1;
-        msg[msg_off..msg_off + 32].copy_from_slice(&pi);
-        msg_off += 32;
-    }
+    // Bulk full blocks.
+    let nblocks = (ctcore_len - ct_off) / 32;
+    em_decrypt_blocks(
+        &ctx.oct.l,
+        &mut n_offset,
+        &mut i,
+        &mut checksum,
+        &ct[ct_off..ct_off + 32 * nblocks],
+        &mut msg[msg_off..msg_off + 32 * nblocks],
+        nblocks,
+    );
+    ct_off += 32 * nblocks;
+    msg_off += 32 * nblocks;
 
     if ct_off == ctcore_len {
         let expected = compute_tag_no_partial(

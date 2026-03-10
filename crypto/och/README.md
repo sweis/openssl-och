@@ -29,12 +29,18 @@ crypto/och/
 │   ├── src/gf.rs       # GF(2^256) doubling, Polyval dot, X2Polyval
 │   ├── src/sponge.rs   # Areion512-based sponge hash
 │   ├── src/och.rs      # OCH seal/open core
-│   └── src/lib.rs      # C FFI exports + KAT tests
+│   ├── src/asm.rs      # FFI bindings to perlasm kernels (x86_64)
+│   ├── src/lib.rs      # C FFI exports + KAT tests
+│   └── build.rs        # perlasm codegen + link (sets cfg(och_asm))
+├── asm/
+│   ├── areion-x86_64.pl# OpenSSL-style perlasm: 4× Areion + bulk EM loop
+│   └── asm_test.c      # ASM-vs-Rust cross-check harness
 ├── och.h               # C API (links against liboch.a)
 ├── bench.c             # OCH vs OpenSSL GCM/OCB/CTR benchmark
 ├── build.info          # OpenSSL build stanza (see NOTES.md for wiring)
-├── Makefile            # standalone build + test + bench
-├── tests/              # (placeholder for future EVP-level test vectors)
+├── Makefile            # standalone build + test + bench + valgrind
+├── tests/ffi_test.c    # C-side seal/open sweep for valgrind
+├── BENCHMARKS.md       # measured results: Rust vs ASM vs OpenSSL
 └── NOTES.md            # design notes, deviations from CLAUDE.md, ref-bugs
 ```
 
@@ -43,15 +49,17 @@ crypto/och/
 Requires a Rust toolchain and system `libcrypto` (OpenSSL ≥ 3.0).
 
 ```sh
-make            # builds rust/target/release/liboch.a and och_bench
-make test       # 6 tests: Areion KATs, Polyval RFC 8452, OCH-P/S KATs,
-                #   multi-length roundtrip — runs on both AES-NI and soft path
+make            # builds rust/target/release/liboch.a + bench + test binaries
+make test       # 11 tests: Areion KATs, Polyval RFC 8452, OCH-P/S KATs,
+                #   multi-length roundtrip, ASM-vs-Rust cross-check
 make bench      # throughput sweep vs AES-256-GCM / AES-128-OCB / AES-256-CTR
+make valgrind   # leak + memory-error check of full C-FFI seal/open path
 ```
 
 The Rust build defaults to `RUSTFLAGS="-C target-feature=+aes,+sse2,+ssse3"`
 for the AES-NI code path. Without `+aes` the software fallback is used (and
-tests still pass against the same KAT vectors).
+tests still pass against the same KAT vectors). Set `OCH_NO_ASM=1` to
+disable the perlasm kernels and use the pure-Rust path.
 
 ## C API
 
@@ -73,43 +81,31 @@ partial plaintext in that case.
 ## Performance
 
 Seal throughput, **Intel Xeon @ 2.80 GHz**, AES-NI enabled, single thread.
-GCM/OCB/CTR numbers are system OpenSSL 3.0.13's hand-tuned assembly.
+OCH uses the bulk-loop perlasm kernel; GCM/OCB/CTR are system OpenSSL
+3.0.13's hand-tuned assembly. Full tables and Rust-vs-ASM comparison in
+[BENCHMARKS.md](BENCHMARKS.md).
 
-### Cycles per byte
+| Bytes | OCH-P (cpb) | OCH-S (cpb) | GCM-256 | OCB-128 | CTR-256 |
+|------:|------:|------:|------:|------:|------:|
+|   1 K |  6.96 | 12.49 |  1.62 |  1.31 |  1.08 |
+|   4 K |  2.39 |  3.76 |  0.96 |  0.73 |  0.83 |
+|  16 K |  1.23 |  1.59 |  0.80 |  0.58 |  0.76 |
+|  64 K |  0.94 |  1.06 |  0.76 |  0.54 |  0.75 |
+|   1 M |  **0.87** |  **0.90** |  0.76 |  0.54 |  0.75 |
 
-| Bytes | OCH-P | OCH-S | AES-256-GCM | AES-128-OCB | AES-256-CTR |
-|------:|------:|------:|------------:|------------:|------------:|
-|    16 |  320.5 |  734.3 |   41.1 |   43.0 |   16.3 |
-|    64 |   77.8 |  148.5 |   11.5 |   11.0 |    4.4 |
-|   256 |   20.0 |   37.7 |    3.3 |    3.0 |    1.4 |
-|   1 K |    5.5 |    9.9 |    1.3 |    1.0 |    0.6 |
-|   4 K |    1.9 |    3.0 |    0.7 |    0.5 |    0.4 |
-|  16 K |    1.0 |    1.3 |    0.6 |    0.3 |    0.4 |
-|  64 K |    0.75 |   0.82 |   0.55 |   0.32 |   0.38 |
-|   1 M |   0.72 |   0.70 |   0.55 |   0.31 |   0.39 |
+At 1 MiB: **OCH-P = 3079 MB/s**, GCM-256 = 3518 MB/s, OCB-128 = 4935 MB/s,
+CTR-256 = 3543 MB/s.
 
-### MB/s
+The raw Areion-256 permutation clocks at **~72 cycles / 32 B block** single-
+block (latency-bound on the 2-deep `aesenc` chain), **~0.86 cpb** with 4-way
+interleaving. The bulk ASM kernel achieves essentially zero mode overhead at
+1 Mi — the seal rate matches the raw permutation rate because offset/checksum
+work is fully hidden behind AES-NI latency.
 
-| Bytes | OCH-P | OCH-S | AES-256-GCM | AES-128-OCB | AES-256-CTR |
-|------:|------:|------:|------------:|------------:|------------:|
-|    16 |      8 |      4 |     65 |     62 |    164 |
-|    64 |     34 |     18 |    232 |    243 |    602 |
-|   256 |    133 |     71 |    815 |    881 |  1 898 |
-|   1 K |    483 |    270 |  2 087 |  2 728 |  4 224 |
-|   4 K |  1 414 |    894 |  3 681 |  5 636 |  6 065 |
-|  16 K |  2 645 |  2 078 |  4 551 |  7 829 |  6 788 |
-|  64 K |  3 543 |  3 246 |  4 843 |  8 452 |  7 030 |
-|   1 M |  3 732 |  3 827 |  4 841 |  8 517 |  6 853 |
-
-The raw Areion-256 permutation clocks at **~59 cycles / 32 B block** (≈ 1.84
-cpb). That floor fully explains the gap vs OCB: AES-128 runs a 16-byte block
-in ≈10 cycles on this part, roughly 3× denser per byte than Areion-256.
-Accounting for that, OCH's mode overhead is comparable to OCB's.
-
-Short-message cost is dominated by the fixed XtH tag pass (≈3 Areion-512
-calls) — the same trade every committing AEAD makes. Large-message throughput
-(≥ 4 K) is within ~1.3× of GCM-256 despite OpenSSL's GCM being a
-hand-optimised Skylake assembly kernel and this code being plain Rust.
+OCB-128 remains ~1.6× ahead: it processes 128-bit blocks (half Areion's
+state) and needs no separate AXU MAC pass. Short-message cost is dominated
+by the fixed XtH tag pass (≈3 Areion-512 calls) — inherent to committing
+AEAD, not the implementation.
 
 [eprint 2026/439]: https://eprint.iacr.org/2026/439
 [eprint 2023/794]: https://eprint.iacr.org/2023/794

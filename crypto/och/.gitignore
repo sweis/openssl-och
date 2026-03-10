@@ -1,3 +1,8 @@
 /och_bench
+/och_bench_noasm
+/asm_test
+/ffi_test
+/asm/*.s
+/asm/*.o
 /rust/target/
 /rust/Cargo.lock

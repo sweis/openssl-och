@@ -223,15 +223,25 @@ int main(void) {
     evp_bench *eo = evp_bench_new("AES-128-OCB", max_mlen, 1);
     evp_bench *ec = evp_bench_new("AES-256-CTR", max_mlen, 0);
 
-    /* ----- Areion256 raw permutation ----- */
+    /* ----- Areion256 raw permutation (1x vs 4x interleave) ----- */
     {
-        uint8_t s[32] = {0};
         const size_t iters = 1 << 20;
+        uint8_t s[32] = {0};
         uint64_t t0 = rdtsc();
         for (size_t i = 0; i < iters; i++) OCH_areion256_permute(s);
-        uint64_t dt = rdtsc() - t0;
-        printf("Areion256 permutation: %.2f cycles / 32B block (= %.3f cpb)\n\n",
-               (double)dt / iters, (double)dt / iters / 32.0);
+        uint64_t dt1 = rdtsc() - t0;
+        double cpb1 = (double)dt1 / iters / 32.0;
+
+        uint8_t s4[128] = {0};
+        t0 = rdtsc();
+        for (size_t i = 0; i < iters; i++) OCH_areion256_permute_x4(s4);
+        uint64_t dt4 = rdtsc() - t0;
+        double cpb4 = (double)dt4 / iters / 128.0;
+
+        printf("Areion256 permutation:   1x %.2f cyc/blk  (= %.3f cpb)\n",
+               (double)dt1 / iters, cpb1);
+        printf("                         4x %.2f cyc/4blk (= %.3f cpb) -- %.2fx\n\n",
+               (double)dt4 / iters, cpb4, cpb1 / cpb4);
     }
 
     /* ----- Main sweep ----- */

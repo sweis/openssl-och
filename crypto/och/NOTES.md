@@ -10,16 +10,28 @@ block cipher). OpenSSL precedent is to give non-AES primitives their own
 directory (`crypto/chacha/`, `crypto/aria/`, `crypto/sm4/`). Putting this
 under `crypto/aes/` would misrepresent the algorithm and tangle build rules.
 
-### 2. No Perl-generated ASM
+### 2. Perl-asm lives under `crypto/och/asm/`, not `crypto/aes/asm/`
 
 CLAUDE.md suggests Perl-asm changes under `crypto/aes/asm/`. Those generators
-produce the AES *block cipher* key schedule and encrypt/decrypt for a dozen
-architectures — they are not a place to emit a new AEAD mode. The Areion
-permutation is implemented directly in Rust using `core::arch::x86_64` AES-NI
-intrinsics (`_mm_aesenc_si128` / `_mm_aesenclast_si128` /
-`_mm_aesdeclast_si128`), which compile to the same single-instruction
-sequences a Perl generator would emit. A constant-time software fallback
-covers non-AES-NI hardware and non-x86 (see `rust/src/aes_soft.rs`).
+produce the AES block cipher key schedule and encrypt/decrypt for a dozen
+architectures — they are the wrong place for a new AEAD mode. The Areion
+perlasm lives in `crypto/och/asm/areion-x86_64.pl` alongside the Rust code,
+driven through OpenSSL's standard `perlasm/x86_64-xlate.pl`.
+
+Primary implementation remains Rust AES-NI intrinsics (`core::arch::x86_64::
+_mm_aesenc_si128` etc.) plus a constant-time software fallback for non-AES-NI
+and non-x86. The perlasm exports an x86_64-only `och_asm_em_enc_bulk` /
+`och_asm_em_dec_bulk` that hoist the entire OCH inner loop — `bsf`-indexed
+L-table offset chain, checksum, 4× interleaved Areion-EM, src→dst stride —
+into one kernel. Enabled via `cfg(och_asm)` set by `build.rs` when the
+perlasm + assemble steps succeed; disabled with `OCH_NO_ASM=1`.
+
+Lesson learned: a naive per-4-block ASM dispatch (compute offsets/checksum
+in Rust, call `em_enc_x4`, repeat) is a net loss vs LLVM-pipelined intrinsics
+— the FFI boundary costs ~30 cycles per stride and LLVM auto-interleaves the
+scalar loop nearly as well as a hand-rolled 4-way kernel. The bulk-loop
+approach (one FFI call per message) is what makes ASM pay off. See
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ### 3. Benchmark targets: GCM, OCB, CTR — not OFB
 

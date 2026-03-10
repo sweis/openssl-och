@@ -86,6 +86,10 @@ ptrdiff_t OCH_areion_open(OCH_CTX ctx,
 /* Raw Areion256 forward permutation (32 bytes in-place). For benchmarking. */
 void OCH_areion256_permute(uint8_t state[32]);
 
+/* Four interleaved Areion256 permutations (4*32 bytes in-place).
+ * Uses the perlasm 4x kernel when available. For benchmarking. */
+void OCH_areion256_permute_x4(uint8_t state[4*32]);
+
 # ifdef __cplusplus
 }
 # endif

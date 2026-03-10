@@ -18,6 +18,8 @@
 
 mod aes_soft;
 mod areion;
+#[cfg(och_asm)]
+mod asm;
 mod gf;
 mod och;
 mod sponge;
@@ -175,6 +177,26 @@ pub extern "C" fn OCH_areion256_permute(state: *mut u8) {
     areion256_forward(s);
 }
 
+/// Raw Areion256 ×4 forward permutation (4×32 bytes in-place).
+/// Uses the Perl-asm kernel when available; otherwise four scalar calls.
+/// Exposed purely for benchmarking the interleaved throughput.
+#[no_mangle]
+pub extern "C" fn OCH_areion256_permute_x4(state: *mut u8) {
+    #[cfg(och_asm)]
+    {
+        let s: &mut [[u8; 32]; 4] = unsafe { &mut *(state as *mut [[u8; 32]; 4]) };
+        crate::asm::areion256_x4(s);
+    }
+    #[cfg(not(och_asm))]
+    {
+        for b in 0..4 {
+            let s: &mut [u8; 32] =
+                unsafe { &mut *(state.add(32 * b) as *mut [u8; 32]) };
+            areion256_forward(s);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // KAT tests
 
@@ -245,7 +267,12 @@ mod tests {
         let key = [0x42u8; 32];
         let pubnonce = [0x42u8; 32];
         let ad = [0x42u8; 128];
-        for mlen in [0, 2, 8, 16, 31, 32, 48, 64, 80, 108, 128, 144, 256, 304] {
+        // Include sizes that exercise the 4-way ASM stride (>= 5 full blocks
+        // after the first = 160+ bytes) and misaligned tails.
+        for mlen in [
+            0, 2, 8, 16, 31, 32, 48, 64, 80, 108, 128, 144, 160, 191, 192, 256,
+            304, 512, 513, 1024, 1025, 4096, 4097,
+        ] {
             let msg: Vec<u8> = (0..mlen).map(|i| (i * 7 + 3) as u8).collect();
             let mut ctx = OchCtx::new_p(&key);
             let mut ct = vec![0u8; mlen + P_OVERHEAD];
