@@ -218,10 +218,13 @@ int main(void) {
     och_bench os = op;
     os.ctx = OCH_areion_s_init(key);
 
-    /* EVP */
-    evp_bench *eg = evp_bench_new("AES-256-GCM", max_mlen, 1);
-    evp_bench *eo = evp_bench_new("AES-128-OCB", max_mlen, 1);
-    evp_bench *ec = evp_bench_new("AES-256-CTR", max_mlen, 0);
+    /* EVP. AES-128-GCM is the paper's primary reference point (0.38 cpb on
+     * Raptor Lake); 256-bit variants show the key-length overhead. */
+    evp_bench *eg1 = evp_bench_new("AES-128-GCM", max_mlen, 1);
+    evp_bench *eg2 = evp_bench_new("AES-256-GCM", max_mlen, 1);
+    evp_bench *eo  = evp_bench_new("AES-128-OCB", max_mlen, 1);
+    evp_bench *ec1 = evp_bench_new("AES-128-CTR", max_mlen, 0);
+    evp_bench *ec2 = evp_bench_new("AES-256-CTR", max_mlen, 0);
 
     /* ----- Areion256 raw permutation (1x vs 4x interleave) ----- */
     {
@@ -245,34 +248,44 @@ int main(void) {
     }
 
     /* ----- Main sweep ----- */
-    printf("%-12s %10s %10s %10s %10s %10s   |   %10s %10s %10s %10s %10s\n",
-           "size", "OCH-P", "OCH-S", "GCM-256", "OCB-128", "CTR-256",
-           "OCH-P", "OCH-S", "GCM-256", "OCB-128", "CTR-256");
-    printf("%-12s %10s %10s %10s %10s %10s   |   %10s %10s %10s %10s %10s\n",
-           "(bytes)", "(cpb)", "(cpb)", "(cpb)", "(cpb)", "(cpb)",
-           "(MB/s)", "(MB/s)", "(MB/s)", "(MB/s)", "(MB/s)");
+    const char *hdr[] = {"OCH-P","OCH-S","GCM-128","GCM-256","OCB-128","CTR-128","CTR-256"};
+    printf("%-9s", "size");
+    for (int c = 0; c < 7; c++) printf(" %8s", hdr[c]);
+    printf("  |  ");
+    for (int c = 0; c < 7; c++) printf(" %8s", hdr[c]);
+    printf("\n%-9s", "(bytes)");
+    for (int c = 0; c < 7; c++) printf(" %8s", "(cpb)");
+    printf("  |  ");
+    for (int c = 0; c < 7; c++) printf(" %8s", "(MB/s)");
+    printf("\n");
 
     double min_sec = 0.25;
     size_t min_iters = 64;
 
     for (size_t i = 0; i < NSIZES; i++) {
         size_t m = SIZES[i];
-        bench_result rp = run_bench(och_p_seal, &op, m, min_sec, min_iters);
-        bench_result rs = run_bench(och_s_seal, &os, m, min_sec, min_iters);
-        bench_result rg = run_bench(evp_seal, eg, m, min_sec, min_iters);
-        bench_result ro = run_bench(evp_seal, eo, m, min_sec, min_iters);
-        bench_result rc = run_bench(evp_seal, ec, m, min_sec, min_iters);
-        printf("%-12zu %10.2f %10.2f %10.2f %10.2f %10.2f   |   %10.1f %10.1f %10.1f %10.1f %10.1f\n",
-               m, rp.cpb, rs.cpb, rg.cpb, ro.cpb, rc.cpb,
-               rp.mbps, rs.mbps, rg.mbps, ro.mbps, rc.mbps);
+        bench_result r[7] = {
+            run_bench(och_p_seal, &op, m, min_sec, min_iters),
+            run_bench(och_s_seal, &os, m, min_sec, min_iters),
+            run_bench(evp_seal, eg1, m, min_sec, min_iters),
+            run_bench(evp_seal, eg2, m, min_sec, min_iters),
+            run_bench(evp_seal, eo,  m, min_sec, min_iters),
+            run_bench(evp_seal, ec1, m, min_sec, min_iters),
+            run_bench(evp_seal, ec2, m, min_sec, min_iters),
+        };
+        printf("%-9zu", m);
+        for (int c = 0; c < 7; c++) printf(" %8.2f", r[c].cpb);
+        printf("  |  ");
+        for (int c = 0; c < 7; c++) printf(" %8.1f", r[c].mbps);
+        printf("\n");
     }
 
     /* Clean up. */
     OCH_areion_free(op.ctx);
     OCH_areion_free(os.ctx);
     free(op.msg); free(op.ct); free(op.ad);
-    evp_bench_free(eg);
+    evp_bench_free(eg1); evp_bench_free(eg2);
     evp_bench_free(eo);
-    evp_bench_free(ec);
+    evp_bench_free(ec1); evp_bench_free(ec2);
     return 0;
 }
