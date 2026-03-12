@@ -25,7 +25,9 @@ mod och;
 mod sponge;
 
 pub use areion::{areion256_backward, areion256_forward, areion512_forward};
-pub use och::{open, seal, OchCtx, KEY_LEN, NONCE_LEN, P_OVERHEAD, S_OVERHEAD, TAG_LEN};
+pub use och::{
+    open, seal, OchCtx, KEY_LEN, MAX_MSG_LEN, NONCE_LEN, P_OVERHEAD, S_OVERHEAD, TAG_LEN,
+};
 
 // ---------------------------------------------------------------------------
 // C FFI
@@ -36,6 +38,31 @@ pub use och::{open, seal, OchCtx, KEY_LEN, NONCE_LEN, P_OVERHEAD, S_OVERHEAD, TA
 
 use core::ptr;
 use core::slice;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+
+/// Build a `&[u8]` from a C pointer/length. Returns `None` if the pointer is
+/// NULL while length > 0 (which would be UB via `slice::from_raw_parts`).
+#[inline]
+unsafe fn c_slice<'a>(p: *const u8, len: usize) -> Option<&'a [u8]> {
+    if len == 0 {
+        Some(&[])
+    } else if p.is_null() {
+        None
+    } else {
+        Some(slice::from_raw_parts(p, len))
+    }
+}
+
+#[inline]
+unsafe fn c_slice_mut<'a>(p: *mut u8, len: usize) -> Option<&'a mut [u8]> {
+    if len == 0 {
+        Some(&mut [])
+    } else if p.is_null() {
+        None
+    } else {
+        Some(slice::from_raw_parts_mut(p, len))
+    }
+}
 
 /// Opaque handle given to C. Actually a Box<OchCtx>.
 pub type OchCtxHandle = *mut OchCtx;
@@ -46,8 +73,8 @@ pub extern "C" fn OCH_areion_p_init(key: *const u8) -> OchCtxHandle {
         return ptr::null_mut();
     }
     let k: &[u8; 32] = unsafe { &*(key as *const [u8; 32]) };
-    let ctx = Box::new(OchCtx::new_p(k));
-    Box::into_raw(ctx)
+    catch_unwind(|| Box::into_raw(Box::new(OchCtx::new_p(k))))
+        .unwrap_or(ptr::null_mut())
 }
 
 #[no_mangle]
@@ -56,8 +83,8 @@ pub extern "C" fn OCH_areion_s_init(key: *const u8) -> OchCtxHandle {
         return ptr::null_mut();
     }
     let k: &[u8; 32] = unsafe { &*(key as *const [u8; 32]) };
-    let ctx = Box::new(OchCtx::new_s(k));
-    Box::into_raw(ctx)
+    catch_unwind(|| Box::into_raw(Box::new(OchCtx::new_s(k))))
+        .unwrap_or(ptr::null_mut())
 }
 
 #[no_mangle]
@@ -95,36 +122,28 @@ pub extern "C" fn OCH_areion_seal(
     if ctx.is_null() {
         return -1;
     }
+    let (ct, msg, ad, pubnonce, secnonce) = unsafe {
+        match (
+            c_slice_mut(ct, ct_cap),
+            c_slice(msg, msg_len),
+            c_slice(ad, ad_len),
+            c_slice(pubnonce, pubnonce_len),
+            c_slice(secnonce, secnonce_len),
+        ) {
+            (Some(a), Some(b), Some(c), Some(d), Some(e)) => (a, b, c, d, e),
+            _ => return -1,
+        }
+    };
     let ctx = unsafe { &mut *ctx };
-    let ct = unsafe { slice::from_raw_parts_mut(ct, ct_cap) };
-    let msg = if msg_len == 0 {
-        &[][..]
-    } else {
-        unsafe { slice::from_raw_parts(msg, msg_len) }
-    };
-    let ad = if ad_len == 0 {
-        &[][..]
-    } else {
-        unsafe { slice::from_raw_parts(ad, ad_len) }
-    };
-    let pubnonce = if pubnonce_len == 0 {
-        &[][..]
-    } else {
-        unsafe { slice::from_raw_parts(pubnonce, pubnonce_len) }
-    };
-    let secnonce = if secnonce_len == 0 {
-        &[][..]
-    } else {
-        unsafe { slice::from_raw_parts(secnonce, secnonce_len) }
-    };
-    match seal(ctx, ct, msg, ad, pubnonce, secnonce) {
-        Some(n) => n as isize,
-        None => -1,
-    }
+    catch_unwind(AssertUnwindSafe(|| seal(ctx, ct, msg, ad, pubnonce, secnonce)))
+        .ok()
+        .flatten()
+        .map_or(-1, |n| n as isize)
 }
 
 /// Returns plaintext length (>=0) on success, -1 on auth failure or error.
-/// Output buffers are NOT wiped on failure; caller must discard.
+/// On auth failure, any unverified plaintext already written to `msg` /
+/// `secnonce_out` is wiped before returning.
 #[no_mangle]
 pub extern "C" fn OCH_areion_open(
     ctx: OchCtxHandle,
@@ -139,42 +158,36 @@ pub extern "C" fn OCH_areion_open(
     pubnonce: *const u8,
     pubnonce_len: usize,
 ) -> isize {
-    if ctx.is_null() || ct.is_null() {
+    if ctx.is_null() {
         return -1;
     }
+    let (msg, secnonce_out, ct, ad, pubnonce) = unsafe {
+        match (
+            c_slice_mut(msg, msg_cap),
+            c_slice_mut(secnonce_out, secnonce_out_len),
+            c_slice(ct, ct_len),
+            c_slice(ad, ad_len),
+            c_slice(pubnonce, pubnonce_len),
+        ) {
+            (Some(a), Some(b), Some(c), Some(d), Some(e)) => (a, b, c, d, e),
+            _ => return -1,
+        }
+    };
     let ctx = unsafe { &mut *ctx };
-    let msg = if msg_cap == 0 {
-        &mut [][..]
-    } else {
-        unsafe { slice::from_raw_parts_mut(msg, msg_cap) }
-    };
-    let secnonce_out = if secnonce_out_len == 0 {
-        &mut [][..]
-    } else {
-        unsafe { slice::from_raw_parts_mut(secnonce_out, secnonce_out_len) }
-    };
-    let ct = unsafe { slice::from_raw_parts(ct, ct_len) };
-    let ad = if ad_len == 0 {
-        &[][..]
-    } else {
-        unsafe { slice::from_raw_parts(ad, ad_len) }
-    };
-    let pubnonce = if pubnonce_len == 0 {
-        &[][..]
-    } else {
-        unsafe { slice::from_raw_parts(pubnonce, pubnonce_len) }
-    };
-    match open(ctx, msg, secnonce_out, ct, ad, pubnonce) {
-        Some(n) => n as isize,
-        None => -1,
-    }
+    catch_unwind(AssertUnwindSafe(|| open(ctx, msg, secnonce_out, ct, ad, pubnonce)))
+        .ok()
+        .flatten()
+        .map_or(-1, |n| n as isize)
 }
 
 /// Raw Areion256 forward permutation (32 bytes in-place). For benchmarking.
 #[no_mangle]
 pub extern "C" fn OCH_areion256_permute(state: *mut u8) {
+    if state.is_null() {
+        return;
+    }
     let s: &mut [u8; 32] = unsafe { &mut *(state as *mut [u8; 32]) };
-    areion256_forward(s);
+    let _ = catch_unwind(AssertUnwindSafe(|| areion256_forward(s)));
 }
 
 /// Raw Areion256 ×4 forward permutation (4×32 bytes in-place).
@@ -182,19 +195,24 @@ pub extern "C" fn OCH_areion256_permute(state: *mut u8) {
 /// Exposed purely for benchmarking the interleaved throughput.
 #[no_mangle]
 pub extern "C" fn OCH_areion256_permute_x4(state: *mut u8) {
-    #[cfg(och_asm)]
-    {
-        let s: &mut [[u8; 32]; 4] = unsafe { &mut *(state as *mut [[u8; 32]; 4]) };
-        crate::asm::areion256_x4(s);
+    if state.is_null() {
+        return;
     }
-    #[cfg(not(och_asm))]
-    {
-        for b in 0..4 {
-            let s: &mut [u8; 32] =
-                unsafe { &mut *(state.add(32 * b) as *mut [u8; 32]) };
-            areion256_forward(s);
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        #[cfg(och_asm)]
+        {
+            let s: &mut [[u8; 32]; 4] = unsafe { &mut *(state as *mut [[u8; 32]; 4]) };
+            crate::asm::areion256_x4(s);
         }
-    }
+        #[cfg(not(och_asm))]
+        {
+            for b in 0..4 {
+                let s: &mut [u8; 32] =
+                    unsafe { &mut *(state.add(32 * b) as *mut [u8; 32]) };
+                areion256_forward(s);
+            }
+        }
+    }));
 }
 
 // ---------------------------------------------------------------------------
@@ -290,5 +308,64 @@ mod tests {
             bad[last] ^= 0x80;
             assert!(open(&mut ctx, &mut dec, &mut [], &bad, &ad, &pubnonce).is_none());
         }
+    }
+
+    #[test]
+    fn large_message_roundtrip() {
+        // Regression test for L-table OOB at ~2 MiB. With L_TABLE_SIZE=16
+        // the block counter i=65536 yielded ntz=16, panicking on l[16].
+        // Now L_TABLE_SIZE=32 covers the full u32 counter range.
+        let key = [0x99u8; 32];
+        let pubnonce = [0x77u8; 32];
+        let mlen: usize = 32 + 65536 * 32; // 2 MiB + 32 bytes
+        let msg: Vec<u8> = (0..mlen).map(|i| (i * 13 + 5) as u8).collect();
+        let mut ctx = OchCtx::new_p(&key);
+        let mut ct = vec![0u8; mlen + P_OVERHEAD];
+        let n = seal(&mut ctx, &mut ct, &msg, &[], &pubnonce, &[]).unwrap();
+        assert_eq!(n, ct.len());
+
+        let mut dec = vec![0u8; mlen];
+        let m = open(&mut ctx, &mut dec, &mut [], &ct, &[], &pubnonce).unwrap();
+        assert_eq!(m, mlen);
+        assert_eq!(dec, msg);
+    }
+
+    #[test]
+    fn wipes_output_on_auth_failure() {
+        let key = [0x11u8; 32];
+        let pubnonce = [0x22u8; 32];
+        let msg = [0x33u8; 128];
+        let mut ctx = OchCtx::new_p(&key);
+        let mut ct = [0u8; 128 + P_OVERHEAD];
+        seal(&mut ctx, &mut ct, &msg, &[], &pubnonce, &[]).unwrap();
+
+        // Tamper with the tag.
+        let last = ct.len() - 1;
+        ct[last] ^= 1;
+
+        let mut dec = [0xffu8; 128];
+        assert!(open(&mut ctx, &mut dec, &mut [], &ct, &[], &pubnonce).is_none());
+        // Unverified plaintext must not leak.
+        assert_eq!(dec, [0u8; 128]);
+    }
+
+    #[test]
+    fn ffi_null_safety() {
+        use core::ptr;
+        // NULL ct buffer with nonzero length must return -1, not UB.
+        let key = [0u8; 32];
+        let ctx = OCH_areion_p_init(key.as_ptr());
+        assert!(!ctx.is_null());
+        let nonce = [0u8; 32];
+        let r = OCH_areion_seal(
+            ctx, ptr::null_mut(), 64, ptr::null(), 0, ptr::null(), 0,
+            nonce.as_ptr(), 32, ptr::null(), 0,
+        );
+        assert_eq!(r, -1);
+        // NULL key rejected by init.
+        assert!(OCH_areion_p_init(ptr::null()).is_null());
+        // NULL state to permute is a no-op, not a crash.
+        OCH_areion256_permute(ptr::null_mut());
+        OCH_areion_free(ctx);
     }
 }

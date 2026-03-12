@@ -74,7 +74,8 @@ ptrdiff_t OCH_areion_seal(OCH_CTX ctx,
  *   OCH-S: pass pubnonce=NULL, pubnonce_len=0, secnonce_out_len=32.
  *
  * Returns plaintext length (>=0) on success, -1 on authentication failure
- * or error. Output buffers are NOT wiped on failure; caller must discard.
+ * or error. On auth failure, any unverified plaintext already written to
+ * msg / secnonce_out is wiped before returning.
  */
 ptrdiff_t OCH_areion_open(OCH_CTX ctx,
                           uint8_t *msg, size_t msg_cap,

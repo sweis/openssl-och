@@ -22,7 +22,15 @@ pub const TAG_LEN: usize = 32;
 pub const P_OVERHEAD: usize = TAG_LEN; // pubnonce variant
 pub const S_OVERHEAD: usize = NONCE_LEN + TAG_LEN; // secret-nonce variant
 
-const L_TABLE_SIZE: usize = 16;
+// L-table must cover every possible ntz(i) for the u32 block counter.
+// i never reaches 0 (see MAX_MSG_LEN) so ntz(i) <= 31.
+const L_TABLE_SIZE: usize = 32;
+
+/// Largest plaintext accepted by seal/open. Keeps the u32 block counter
+/// strictly below 2^32 so ntz(i) stays < L_TABLE_SIZE and `bsf` in the
+/// ASM kernel never sees a zero operand (undefined result on x86).
+/// 32 * (2^32 - 2) bytes ~= 127 GiB.
+pub const MAX_MSG_LEN: u64 = 32 * (u32::MAX as u64 - 1);
 
 const LABEL_KG_TBC: u8 = 0xf0;
 const LABEL_KG_AXU: u8 = 0xf1;
@@ -453,6 +461,9 @@ pub fn seal(
     if pubnonce.len() != pnl || secnonce.len() != snl {
         return None;
     }
+    if msg.len() as u64 > MAX_MSG_LEN {
+        return None;
+    }
     let ct_len = snl + msg.len() + TAG_LEN;
     if ct.len() < ct_len {
         return None;
@@ -589,8 +600,8 @@ pub fn seal(
 
 /// Generic open. On success, plaintext is written to `msg` and (for OCH-S)
 /// the recovered secret nonce to `secnonce_out`. Returns the plaintext length.
-/// On auth failure, returns None and **does not** zero the output buffer
-/// (caller must discard it).
+/// On auth failure, returns None after wiping any unverified plaintext
+/// written to `msg` / `secnonce_out`.
 pub fn open(
     ctx: &mut OchCtx,
     msg: &mut [u8],
@@ -609,7 +620,7 @@ pub fn open(
     }
     let ctcore_len = ct.len() - TAG_LEN;
     let msg_len = ctcore_len - snl;
-    if msg.len() < msg_len {
+    if msg.len() < msg_len || msg_len as u64 > MAX_MSG_LEN {
         return None;
     }
     let given_tag: &[u8; 32] = ct[ctcore_len..].try_into().unwrap();
@@ -637,6 +648,7 @@ pub fn open(
         return if ct_eq(&expected, given_tag) {
             Some(msg_len)
         } else {
+            wipe(&mut msg[..msg_len]);
             None
         };
     }
@@ -704,6 +716,8 @@ pub fn open(
         return if ct_eq(&expected, given_tag) {
             Some(msg_len)
         } else {
+            wipe(&mut msg[..msg_len]);
+            wipe(secnonce_out);
             None
         };
     }
@@ -733,6 +747,8 @@ pub fn open(
     if ct_eq(&expected, given_tag) {
         Some(msg_len)
     } else {
+        wipe(&mut msg[..msg_len]);
+        wipe(secnonce_out);
         None
     }
 }
@@ -744,4 +760,13 @@ fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
         d |= a[i] ^ b[i];
     }
     d == 0
+}
+
+/// Best-effort wipe. `#[inline(never)]` + volatile writes keeps the
+/// compiler from eliding the loop as dead store.
+#[inline(never)]
+fn wipe(buf: &mut [u8]) {
+    for b in buf {
+        unsafe { core::ptr::write_volatile(b, 0) };
+    }
 }

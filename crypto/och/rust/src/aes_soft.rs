@@ -6,6 +6,11 @@
 //!   aesdeclast(s, rk) = InvSubBytes(InvShiftRows(s)) ^ rk
 //!
 //! Used as a portable fallback when AES-NI is unavailable.
+//!
+//! NOTE: this fallback is NOT constant-time. S-box lookups are secret-
+//! indexed table reads and are vulnerable to cache-timing attacks. Use
+//! only where AES-NI is unavailable and timing attacks are not a concern
+//! (e.g. offline testing). Production deployments should require AES-NI.
 
 #![cfg_attr(all(target_arch = "x86_64", target_feature = "aes"), allow(dead_code))]
 
