@@ -2702,6 +2702,8 @@ ecp_nistz256_gather_w5:
 ___
 $code.=<<___	if ($avx>1);
 	mov	OPENSSL_ia32cap_P+8(%rip), %eax
+	test	\$`1<<16`, %eax		# AVX512F
+	jnz	.Lavx512_gather_w5
 	test	\$`1<<5`, %eax
 	jnz	.Lavx2_gather_w5
 ___
@@ -3179,6 +3181,52 @@ ecp_nistz256_avx512_gather_w7:
 	ret
 .cfi_endproc
 .size	ecp_nistz256_avx512_gather_w7,.-ecp_nistz256_avx512_gather_w7
+___
+}
+################################################################################
+# AVX-512 constant-time gather over the 16-entry Jacobian table. Each entry is
+# 96 bytes, loaded as one ZMM (X,Y) plus one YMM (Z) per entry; the YMM masked
+# load uses the low 8 bits of the same k-mask.
+{
+my ($val,$in_t,$index)=$win64?("%rcx","%rdx","%r8d"):("%rdi","%rsi","%edx");
+
+$code.=<<___;
+.type	ecp_nistz256_avx512_gather_w5,\@abi-omnipotent
+.align	32
+ecp_nistz256_avx512_gather_w5:
+.cfi_startproc
+.Lavx512_gather_w5:
+	vpbroadcastd	$index, %zmm0
+	vpxord		%zmm5, %zmm5, %zmm5	# accumulator for X,Y (64B)
+	vpxor		%ymm6, %ymm6, %ymm6	# accumulator for Z (32B)
+	vpbroadcastd	.LOne(%rip), %zmm1	# counter = 1
+	vpaddd		%zmm1, %zmm1, %zmm9	# stride  = 2
+	vpaddd		%zmm1, %zmm1, %zmm2	# counter = 2
+
+	mov	\$8, %eax
+.Lselect_loop_avx512_w5:
+	vpcmpeqd	%zmm0, %zmm1, %k1
+	vpcmpeqd	%zmm0, %zmm2, %k2
+	vmovdqu64	96*0($in_t), %zmm3{%k1}{z}	# point0 X,Y
+	vmovdqu64	96*0+64($in_t), %ymm7{%k1}{z}	# point0 Z
+	vmovdqu64	96*1($in_t), %zmm4{%k2}{z}	# point1 X,Y
+	vmovdqu64	96*1+64($in_t), %ymm8{%k2}{z}	# point1 Z
+	vpaddd		%zmm9, %zmm1, %zmm1
+	vpaddd		%zmm9, %zmm2, %zmm2
+	vpord		%zmm3, %zmm5, %zmm5
+	vpord		%ymm7, %ymm6, %ymm6
+	vpord		%zmm4, %zmm5, %zmm5
+	vpord		%ymm8, %ymm6, %ymm6
+	lea		96*2($in_t), $in_t
+	dec		%eax
+	jnz		.Lselect_loop_avx512_w5
+
+	vmovdqu64	%zmm5, ($val)
+	vmovdqu64	%ymm6, 64($val)
+	vzeroupper
+	ret
+.cfi_endproc
+.size	ecp_nistz256_avx512_gather_w5,.-ecp_nistz256_avx512_gather_w5
 ___
 }
 if ($avx>1) {
