@@ -104,23 +104,39 @@ Post-change profile showed `vbroadcastf64x2` at ~0% and `vmovdqa64` at 10.6%
 — the cycles reattributed one-for-one. The 6.8% on broadcasts was measuring
 **load latency**, not port-5 pressure.
 
-### Why GCM is already optimal on Sapphire Rapids
+### Hypothesis tested: Karatsuba GHASH (−25% vpclmulqdq)
 
-Port-0 throughput ceiling (AES-128, ZMM, 1 op/cycle):
+`aes-gcm-avx512.pl:847` uses 4-clmul schoolbook per 4-block ZMM; other
+OpenSSL GHASH backends (ARM, PPC, x86-32) already use 3-clmul Karatsuba.
+A static port model suggested this should help: on SPR, VAES is 2/cycle
+(ports 0+1) so AES bounds at 60 cyc/iter; 51 vpclmulqdq on port 5 bounds
+at 75 cyc/iter, making port 5 the long pole.
 
-    4 blocks / 10 AES ops × 2.1 GHz × 16 B = 13.44 GB/s
+**Probe: drop the 4th clmul from each hot-loop cluster** (breaks
+correctness, removes exactly what Karatsuba would save).
 
-Measured 12.67 GB/s = **94.3 % of the ceiling**. The `vbroadcastf64x2`
-instructions execute in the shadow of the vaesenc dependency chains
-(4-cycle latency × 10 rounds = 40-cycle critical path per 16-block chunk,
-plenty of slack to hide the 11 key loads). Port 5 is not the bottleneck.
+|         | mean         | median       | per-run delta       |
+|---------|--------------|--------------|---------------------|
+| base    | 13199.3 MB/s | 13282.7 MB/s | —                   |
+| −12 clmul| 13198.0 MB/s | 13339.9 MB/s | −2.2 % .. +1.9 % noise |
 
-The existing `aes-gcm-avx512.pl` ping-pong key-load scheme
-(AESKEY1/AESKEY2 prefetching the next round while the current one runs)
-already extracts all available ILP.
+**Zero measurable change.** GHASH is not the bottleneck.
 
-### Security note
+### Conclusion
 
-The tested change was reverted. Holding replicated key material in an
-extra 960 B stack region for zero performance gain is a small but strictly
-negative trade.
+Two independent port-5-targeted probes (−33 shuffle µops, then −12 clmul)
+both returned null. Port 5 is not the limiting resource on this CPU, so
+Karatsuba — whose only benefit is saving port-5 clmul — cannot help.
+
+What *does* limit the loop at ~127 cyc/iter is not pinned down by these
+probes. The counter prep is hoisted before the AES rounds at
+`aes-gcm-avx512.pl:3024` so the three 40-cycle vaesenc latency chains
+should in principle overlap via renaming; observed throughput suggests
+they don't fully. Plausible suspects are PRF/ROB pressure with 3 chunks
+of ZMM renames simultaneously in flight, but confirming that would need
+PMU counters this virtualized host does not expose.
+
+Both tested changes were reverted: neither performance-neutral added code
+nor broken correctness belong in a crypto library. The negative result is
+the deliverable — it rules out the instruction-selection class of GCM
+optimizations on this microarchitecture without committing any code.
