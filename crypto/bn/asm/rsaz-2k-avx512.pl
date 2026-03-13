@@ -600,6 +600,446 @@ $code.=<<___;
 ___
 }
 
+###############################################################################
+# ZMM dual AMM for 20-digit number in radix 2^52.
+#
+# Each number is stored in 24 qwords (3 ZMM registers; lanes 20-23 are zero
+# padding). On Sapphire Rapids, YMM vpmadd52 dispatches to ports {0,1,5}, so
+# the 40 YMM IFMA ops in the x2 loop above contend with mulx/imulq (port 1
+# only). ZMM vpmadd52 uses a narrower port set, which — combined with needing
+# only 24 ops instead of 40 — removes port-1 contention and lets the scalar
+# chain run in parallel. The 4 wasted lanes compute 0*x=0 and never feed back.
+#
+# void ossl_rsaz_amm52x20_x2_ifma512(BN_ULONG out[2][24],
+#                                    const BN_ULONG a[2][24],
+#                                    const BN_ULONG b[2][24],
+#                                    const BN_ULONG m[2][24],
+#                                    const BN_ULONG k0[2]);
+###############################################################################
+{
+my ($res,$a,$b,$m,$k0) = @_6_args_universal_ABI;
+
+my $mask52     = "%rax";
+my $acc_A      = "%r9";
+my $acc_B      = "%r15";
+my $b_ptr      = "%r11";
+my $iter       = "%ebx";
+
+my $zzero      = "%zmm0";
+my ($BiA,$YiA) = ("%zmm1","%zmm2");
+my ($BiB,$YiB) = ("%zmm3","%zmm4");
+my ($ZA0,$ZA1,$ZA2) = ("%zmm16","%zmm17","%zmm18");
+my ($ZB0,$ZB1,$ZB2) = ("%zmm19","%zmm20","%zmm21");
+my $ZA0_xmm = "%xmm16";
+my $ZB0_xmm = "%xmm19";
+
+my ($T0,$T1,$T2) = ("%zmm22","%zmm23","%zmm24");
+my $Mask52 = "%zmm25";
+
+# 24 qwords per number.
+my $OFF_B = 24*8;
+
+$code.=<<___;
+.text
+
+.globl  ossl_rsaz_amm52x20_x1_ifma512
+.type   ossl_rsaz_amm52x20_x1_ifma512,\@function,5
+.align 32
+ossl_rsaz_amm52x20_x1_ifma512:
+.cfi_startproc
+    endbranch
+    push    %rbx
+.cfi_push   %rbx
+    push    %rbp
+.cfi_push   %rbp
+    push    %r12
+.cfi_push   %r12
+    push    %r13
+.cfi_push   %r13
+    push    %r14
+.cfi_push   %r14
+    push    %r15
+.cfi_push   %r15
+.Lossl_rsaz_amm52x20_x1_ifma512_body:
+
+    vpxord   $zzero, $zzero, $zzero
+    vmovdqa64   $zzero, $ZA0
+    vmovdqa64   $zzero, $ZA1
+    vmovdqa64   $zzero, $ZA2
+
+    xorl    %r9d, %r9d
+
+    movq    $b, $b_ptr
+    movq    \$0xfffffffffffff, $mask52
+    movq    $k0, %rbp                # k0 is a value here, save it (r8 gets clobbered by norm)
+
+    mov     \$20, $iter
+
+.align 32
+.Lloop20_zmm_x1:
+    movq    0($b_ptr), %r13
+    vpbroadcastq    %r13, $BiA
+    movq    0($a), %rdx
+    mulx    %r13, %r13, %r12
+    addq    %r13, $acc_A
+    movq    %r12, %r10
+    adcq    \$0, %r10
+    movq    %rbp, %r13
+    imulq   $acc_A, %r13
+    andq    $mask52, %r13
+    vpbroadcastq    %r13, $YiA
+    movq    0($m), %rdx
+    mulx    %r13, %r13, %r12
+    addq    %r13, $acc_A
+    adcq    %r12, %r10
+    shrq    \$52, $acc_A
+    salq    \$12, %r10
+    or      %r10, $acc_A
+
+    vpmadd52luq `64*0`($a), $BiA, $ZA0
+    vpmadd52luq `64*1`($a), $BiA, $ZA1
+    vpmadd52luq `64*2`($a), $BiA, $ZA2
+    vpmadd52luq `64*0`($m), $YiA, $ZA0
+    vpmadd52luq `64*1`($m), $YiA, $ZA1
+    vpmadd52luq `64*2`($m), $YiA, $ZA2
+    valignq     \$1, $ZA0, $ZA1, $ZA0
+    valignq     \$1, $ZA1, $ZA2, $ZA1
+    valignq     \$1, $ZA2, $zzero, $ZA2
+    vmovq   $ZA0_xmm, %r13
+    addq    %r13, $acc_A
+    vpmadd52huq `64*0`($a), $BiA, $ZA0
+    vpmadd52huq `64*1`($a), $BiA, $ZA1
+    vpmadd52huq `64*2`($a), $BiA, $ZA2
+    vpmadd52huq `64*0`($m), $YiA, $ZA0
+    vpmadd52huq `64*1`($m), $YiA, $ZA1
+    vpmadd52huq `64*2`($m), $YiA, $ZA2
+
+    lea     8($b_ptr), $b_ptr
+    dec     $iter
+    jne     .Lloop20_zmm_x1
+
+    vpbroadcastq .Lmask52x4(%rip), $Mask52
+___
+    &norm_zmm($acc_A, $ZA0, $ZA1, $ZA2, 0);
+$code.=<<___;
+    vzeroupper
+    mov  0(%rsp),%r15
+.cfi_restore    %r15
+    mov  8(%rsp),%r14
+.cfi_restore    %r14
+    mov  16(%rsp),%r13
+.cfi_restore    %r13
+    mov  24(%rsp),%r12
+.cfi_restore    %r12
+    mov  32(%rsp),%rbp
+.cfi_restore    %rbp
+    mov  40(%rsp),%rbx
+.cfi_restore    %rbx
+    lea  48(%rsp),%rsp
+.cfi_adjust_cfa_offset  -48
+.Lossl_rsaz_amm52x20_x1_ifma512_epilogue:
+    ret
+.cfi_endproc
+.size   ossl_rsaz_amm52x20_x1_ifma512, .-ossl_rsaz_amm52x20_x1_ifma512
+
+.globl  ossl_rsaz_amm52x20_x2_ifma512
+.type   ossl_rsaz_amm52x20_x2_ifma512,\@function,5
+.align 32
+ossl_rsaz_amm52x20_x2_ifma512:
+.cfi_startproc
+    endbranch
+    push    %rbx
+.cfi_push   %rbx
+    push    %rbp
+.cfi_push   %rbp
+    push    %r12
+.cfi_push   %r12
+    push    %r13
+.cfi_push   %r13
+    push    %r14
+.cfi_push   %r14
+    push    %r15
+.cfi_push   %r15
+.Lossl_rsaz_amm52x20_x2_ifma512_body:
+
+    vpxord   $zzero, $zzero, $zzero
+    vmovdqa64   $zzero, $ZA0
+    vmovdqa64   $zzero, $ZA1
+    vmovdqa64   $zzero, $ZA2
+    vmovdqa64   $zzero, $ZB0
+    vmovdqa64   $zzero, $ZB1
+    vmovdqa64   $zzero, $ZB2
+
+    xorl    %r9d, %r9d
+    xorl    %r15d, %r15d
+
+    movq    $b, $b_ptr
+    movq    \$0xfffffffffffff, $mask52
+
+    mov     \$20, $iter
+
+.align 32
+.Lloop20_zmm:
+    # Load and broadcast b[i] for both, then issue luq(a,Bi). None of this
+    # depends on acc, only on the previous iteration's R (via huq). Hoisting
+    # above the scalar chain lets both dep chains start sooner.
+    movq    0($b_ptr), %r13
+    movq    $OFF_B($b_ptr), %r14
+    vpbroadcastq    %r13, $BiA
+    vpbroadcastq    %r14, $BiB
+    vpmadd52luq `64*0`($a),        $BiA, $ZA0
+    vpmadd52luq `$OFF_B+64*0`($a), $BiB, $ZB0
+    vpmadd52luq `64*1`($a),        $BiA, $ZA1
+    vpmadd52luq `$OFF_B+64*1`($a), $BiB, $ZB1
+    vpmadd52luq `64*2`($a),        $BiA, $ZA2
+    vpmadd52luq `$OFF_B+64*2`($a), $BiB, $ZB2
+
+    # --- A scalar: yi; r14 still holds b[i]_B ---
+    movq    0($a), %rdx
+    mulx    %r13, %r13, %r12
+    addq    %r13, $acc_A
+    movq    %r12, %r10
+    adcq    \$0, %r10
+    movq    ($k0), %r13
+    imulq   $acc_A, %r13
+    andq    $mask52, %r13
+    vpbroadcastq    %r13, $YiA
+    vpmadd52luq `64*0`($m), $YiA, $ZA0
+    movq    0($m), %rdx
+    vpmadd52luq `64*1`($m), $YiA, $ZA1
+    mulx    %r13, %r13, %r12
+    vpmadd52luq `64*2`($m), $YiA, $ZA2
+    addq    %r13, $acc_A
+    adcq    %r12, %r10
+    shrq    \$52, $acc_A
+    salq    \$12, %r10
+    or      %r10, $acc_A
+
+    valignq     \$1, $ZA0, $ZA1, $ZA0
+    valignq     \$1, $ZA1, $ZA2, $ZA1
+    valignq     \$1, $ZA2, $zzero, $ZA2
+    vmovq   $ZA0_xmm, %r13
+    addq    %r13, $acc_A
+
+    # --- B scalar (woven with A's huq) ---
+    movq    $OFF_B($a), %rdx
+    mulx    %r14, %r14, %r12
+     vpmadd52huq `64*0`($a), $BiA, $ZA0
+    addq    %r14, $acc_B
+     vpmadd52huq `64*1`($a), $BiA, $ZA1
+    movq    %r12, %r10
+    adcq    \$0, %r10
+     vpmadd52huq `64*2`($a), $BiA, $ZA2
+    movq    8($k0), %r14
+    imulq   $acc_B, %r14
+     vpmadd52huq `64*0`($m), $YiA, $ZA0
+    andq    $mask52, %r14
+    vpbroadcastq    %r14, $YiB
+     vpmadd52huq `64*1`($m), $YiA, $ZA1
+     vpmadd52luq `$OFF_B+64*0`($m), $YiB, $ZB0
+    movq    $OFF_B($m), %rdx
+     vpmadd52huq `64*2`($m), $YiA, $ZA2
+     vpmadd52luq `$OFF_B+64*1`($m), $YiB, $ZB1
+    mulx    %r14, %r14, %r12
+     vpmadd52luq `$OFF_B+64*2`($m), $YiB, $ZB2
+    addq    %r14, $acc_B
+    adcq    %r12, %r10
+    shrq    \$52, $acc_B
+    salq    \$12, %r10
+    or      %r10, $acc_B
+
+    valignq     \$1, $ZB0, $ZB1, $ZB0
+    valignq     \$1, $ZB1, $ZB2, $ZB1
+    valignq     \$1, $ZB2, $zzero, $ZB2
+    vmovq   $ZB0_xmm, %r14
+    addq    %r14, $acc_B
+
+    vpmadd52huq `$OFF_B+64*0`($a), $BiB, $ZB0
+    vpmadd52huq `$OFF_B+64*1`($a), $BiB, $ZB1
+    vpmadd52huq `$OFF_B+64*2`($a), $BiB, $ZB2
+    vpmadd52huq `$OFF_B+64*0`($m), $YiB, $ZB0
+    vpmadd52huq `$OFF_B+64*1`($m), $YiB, $ZB1
+    vpmadd52huq `$OFF_B+64*2`($m), $YiB, $ZB2
+
+    lea     8($b_ptr), $b_ptr
+    dec     $iter
+    jne     .Lloop20_zmm
+___
+
+# Normalization for ZMM. One register holds 8 lanes; 3 registers per number.
+# Carry masks are 8+8+8 = 24 bits (lanes 20-23 are always zero, so their
+# mask bits are always zero and cannot generate carries).
+sub norm_zmm {
+my ($_acc, $_Z0, $_Z1, $_Z2, $_out_off) = @_;
+$code.=<<___;
+    mov     \$1, %ecx
+    kmovb   %ecx, %k1
+    vpbroadcastq    $_acc, ${_Z0}{%k1}   # put acc into lane 0 (masked merge)
+
+    vpsrlq    \$52, $_Z0, $T0
+    vpsrlq    \$52, $_Z1, $T1
+    vpsrlq    \$52, $_Z2, $T2
+
+    valignq   \$7, $T1, $T2, $T2    # T2 = [T1[7], T2[0..6]]
+    valignq   \$7, $T0, $T1, $T1    # T1 = [T0[7], T1[0..6]]
+    valignq   \$7, $zzero, $T0, $T0 # T0 = [0, T0[0..6]]
+
+    vpandq    $Mask52, $_Z0, $_Z0
+    vpandq    $Mask52, $_Z1, $_Z1
+    vpandq    $Mask52, $_Z2, $_Z2
+
+    vpaddq    $T0, $_Z0, $_Z0
+    vpaddq    $T1, $_Z1, $_Z1
+    vpaddq    $T2, $_Z2, $_Z2
+
+    # T2[4] carries lane-19's overflow bits into lane 20 above. That lane must
+    # stay zero so it does not get shifted into lane 19 on the next call.
+    mov     \$0xF0, %ecx
+    kmovb   %ecx, %k1
+    vmovdqa64 $zzero, ${_Z2}{%k1}
+
+    vpcmpuq   \$6, $Mask52, $_Z0, %k1
+    vpcmpuq   \$6, $Mask52, $_Z1, %k2
+    vpcmpuq   \$6, $Mask52, $_Z2, %k3
+    kmovb   %k1, %r14d
+    kmovb   %k2, %r13d
+    kmovb   %k3, %r12d
+
+    vpcmpuq   \$0, $Mask52, $_Z0, %k1
+    vpcmpuq   \$0, $Mask52, $_Z1, %k2
+    vpcmpuq   \$0, $Mask52, $_Z2, %k3
+    kmovb   %k1, %r11d
+    kmovb   %k2, %r10d
+    kmovb   %k3, %r9d
+
+    # Assemble 24-bit overflow and saturated vectors.
+    shl   \$8, %r13d
+    shl   \$16, %r12d
+    or    %r13d, %r14d
+    or    %r12d, %r14d  # r14d = overflow[0..23]
+    shl   \$8, %r10d
+    shl   \$16, %r9d
+    or    %r10d, %r11d
+    or    %r9d, %r11d   # r11d = saturated[0..23]
+
+    add   %r14d, %r14d  # overflow << 1
+    add   %r11d, %r14d  # + saturated (carries ripple through saturated lanes)
+    xor   %r11d, %r14d  # isolate lanes that got a carry-in
+
+    kmovb   %r14d, %k1
+    shr     \$8, %r14d
+    kmovb   %r14d, %k2
+    shr     \$8, %r14d
+    kmovb   %r14d, %k3
+
+    vpsubq  $Mask52, $_Z0, ${_Z0}{%k1}
+    vpsubq  $Mask52, $_Z1, ${_Z1}{%k2}
+    vpsubq  $Mask52, $_Z2, ${_Z2}{%k3}
+
+    vpandq  $Mask52, $_Z0, $_Z0
+    vpandq  $Mask52, $_Z1, $_Z1
+    vpandq  $Mask52, $_Z2, $_Z2
+
+    vmovdqu64   $_Z0, `$_out_off+64*0`($res)
+    vmovdqu64   $_Z1, `$_out_off+64*1`($res)
+    vmovdqu64   $_Z2, `$_out_off+64*2`($res)
+___
+}
+
+$code.=<<___;
+    vpbroadcastq .Lmask52x4(%rip), $Mask52
+___
+
+    &norm_zmm($acc_A, $ZA0, $ZA1, $ZA2, 0);
+    &norm_zmm($acc_B, $ZB0, $ZB1, $ZB2, $OFF_B);
+
+$code.=<<___;
+    vzeroupper
+    mov  0(%rsp),%r15
+.cfi_restore    %r15
+    mov  8(%rsp),%r14
+.cfi_restore    %r14
+    mov  16(%rsp),%r13
+.cfi_restore    %r13
+    mov  24(%rsp),%r12
+.cfi_restore    %r12
+    mov  32(%rsp),%rbp
+.cfi_restore    %rbp
+    mov  40(%rsp),%rbx
+.cfi_restore    %rbx
+    lea  48(%rsp),%rsp
+.cfi_adjust_cfa_offset  -48
+.Lossl_rsaz_amm52x20_x2_ifma512_epilogue:
+    ret
+.cfi_endproc
+.size   ossl_rsaz_amm52x20_x2_ifma512, .-ossl_rsaz_amm52x20_x2_ifma512
+___
+}
+
+###############################################################################
+# Constant-time extraction for 24-qword layout.
+#
+# void ossl_extract_multiplier_2x20_win5_zmm(BN_ULONG *red_Y,
+#                                            const BN_ULONG red_table[1<<5][2][24],
+#                                            int red_table_idx1, int red_table_idx2);
+###############################################################################
+{
+my ($out,$red_tbl,$red_tbl_idx1,$red_tbl_idx2)=$win64 ? ("%rcx","%rdx","%r8","%r9") :
+                                                        ("%rdi","%rsi","%rdx","%rcx");
+my ($t0,$t1,$t2,$t3,$t4,$t5) = map("%zmm$_", (0..5));
+my ($tmp,$cur_idx,$idx1,$idx2,$ones) = map("%zmm$_", (16..20));
+my @t = ($t0,$t1,$t2,$t3,$t4,$t5);
+
+$code.=<<___;
+.text
+
+.align 32
+.globl  ossl_extract_multiplier_2x20_win5_zmm
+.type   ossl_extract_multiplier_2x20_win5_zmm,\@abi-omnipotent
+ossl_extract_multiplier_2x20_win5_zmm:
+.cfi_startproc
+    endbranch
+    vpbroadcastq    .Lones(%rip), $ones
+    vpbroadcastq    $red_tbl_idx1, $idx1
+    vpbroadcastq    $red_tbl_idx2, $idx2
+    leaq   `(1<<5)*2*24*8`($red_tbl), %rax
+
+    vpxord  $t0, $t0, $t0
+    vmovdqa64   $t0, $cur_idx
+___
+foreach (1..5) {
+    $code.="    vmovdqa64   $t0, $t[$_]\n";
+}
+$code.=<<___;
+
+.align 32
+.Lloop_zmm_ext:
+    vpcmpq  \$0, $cur_idx, $idx1, %k1
+    vpcmpq  \$0, $cur_idx, $idx2, %k2
+___
+foreach (0..5) {
+    my $mask = $_<3?"%k1":"%k2";
+$code.=<<___;
+    vmovdqu64  `${_}*64`($red_tbl), $tmp
+    vpblendmq  $tmp, $t[$_], ${t[$_]}{$mask}
+___
+}
+$code.=<<___;
+    vpaddq  $ones, $cur_idx, $cur_idx
+    addq    \$`2*24*8`, $red_tbl
+    cmpq    $red_tbl, %rax
+    jne .Lloop_zmm_ext
+___
+foreach (0..5) {
+    $code.="    vmovdqu64   $t[$_], `${_}*64`($out)\n";
+}
+$code.=<<___;
+    ret
+.cfi_endproc
+.size   ossl_extract_multiplier_2x20_win5_zmm, .-ossl_extract_multiplier_2x20_win5_zmm
+___
+}
+
 if ($win64) {
 $rec="%rcx";
 $frame="%rdx";
