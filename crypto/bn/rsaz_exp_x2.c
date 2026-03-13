@@ -75,6 +75,20 @@ void ossl_extract_multiplier_2x20_win5(BN_ULONG *red_Y,
     const BN_ULONG *red_table,
     int red_table_idx1, int red_table_idx2);
 
+/*
+ * ZMM variants for 1024-bit. Data layout: 24 qwords per number (3 ZMM),
+ * lanes 20-23 must be zero on input and will be zero on output.
+ */
+void ossl_rsaz_amm52x20_x1_ifma512(BN_ULONG *res, const BN_ULONG *a,
+    const BN_ULONG *b, const BN_ULONG *m,
+    BN_ULONG k0);
+void ossl_rsaz_amm52x20_x2_ifma512(BN_ULONG *out, const BN_ULONG *a,
+    const BN_ULONG *b, const BN_ULONG *m,
+    const BN_ULONG k0[2]);
+void ossl_extract_multiplier_2x20_win5_zmm(BN_ULONG *red_Y,
+    const BN_ULONG *red_table,
+    int red_table_idx1, int red_table_idx2);
+
 void ossl_rsaz_amm52x30_x1_ifma256(BN_ULONG *res, const BN_ULONG *a,
     const BN_ULONG *b, const BN_ULONG *m,
     BN_ULONG k0);
@@ -231,8 +245,7 @@ int ossl_rsaz_mod_exp_avx512_x2(BN_ULONG *res1,
     BN_ULONG *coeff_red;
     BN_ULONG *storage = NULL;
     BN_ULONG *storage_aligned = NULL;
-    int storage_len_bytes = 7 * regs_capacity * sizeof(BN_ULONG)
-        + 64 /* alignment */;
+    int storage_len_bytes;
 
     const BN_ULONG *exp[2] = { 0 };
     BN_ULONG k0[2] = { 0 };
@@ -243,7 +256,20 @@ int ossl_rsaz_mod_exp_avx512_x2(BN_ULONG *res1,
     if (factor_size != 1024 && factor_size != 1536 && factor_size != 2048)
         goto err;
 
-    amm = ossl_rsaz_amm52_x1[(factor_size / 512 - 2) * 2 + avx512ifma];
+    /*
+     * For 1024-bit under AVX-512, the ZMM kernel uses 3x8=24 qwords per
+     * number (top 4 lanes are zero padding). On CPUs that dispatch ZMM
+     * vpmadd52 away from port 1, this removes port-1 contention with mulx
+     * and imulq in the scalar chain.
+     */
+    if (avx512ifma && factor_size == 1024) {
+        regs_capacity = 24;
+        amm = ossl_rsaz_amm52x20_x1_ifma512;
+    } else {
+        amm = ossl_rsaz_amm52_x1[(factor_size / 512 - 2) * 2 + avx512ifma];
+    }
+
+    storage_len_bytes = 7 * regs_capacity * sizeof(BN_ULONG) + 64 /* alignment */;
 
     storage = (BN_ULONG *)OPENSSL_malloc(storage_len_bytes);
     if (storage == NULL)
@@ -283,7 +309,7 @@ int ossl_rsaz_mod_exp_avx512_x2(BN_ULONG *res1,
      *
      *  EX/ modlen = 1024: k = 64, RR = 2^2048 mod m, RR' = 2^2080 mod m
      */
-    memset(coeff_red, 0, exp_digits * sizeof(BN_ULONG));
+    memset(coeff_red, 0, regs_capacity * sizeof(BN_ULONG));
     /* (1) in reduced domain representation */
     set_bit(coeff_red, 64 * (int)(coeff_pow / 52) + coeff_pow % 52);
 
@@ -384,6 +410,7 @@ int RSAZ_mod_exp_x2_ifma256(BN_ULONG *out,
     /* Extractor from red_table */
     DEXTRACT extract = NULL;
     int avx512ifma = !!ossl_rsaz_avx512ifma_eligible();
+    int use_zmm = (avx512ifma && modulus_bitsize == 1024);
 
 /*
  * Squaring is done using multiplication now. That can be a subject of
@@ -394,12 +421,17 @@ int RSAZ_mod_exp_x2_ifma256(BN_ULONG *out,
     if (modulus_bitsize != 1024 && modulus_bitsize != 1536 && modulus_bitsize != 2048)
         goto err;
 
-    damm = ossl_rsaz_amm52_x2[(modulus_bitsize / 512 - 2) * 2 + avx512ifma];
-    extract = ossl_extract_multiplier_win5[(modulus_bitsize / 512 - 2) * 2 + avx512ifma];
+    if (use_zmm) {
+        damm = ossl_rsaz_amm52x20_x2_ifma512;
+        extract = ossl_extract_multiplier_2x20_win5_zmm;
+    } else {
+        damm = ossl_rsaz_amm52_x2[(modulus_bitsize / 512 - 2) * 2 + avx512ifma];
+        extract = ossl_extract_multiplier_win5[(modulus_bitsize / 512 - 2) * 2 + avx512ifma];
+    }
 
     switch (modulus_bitsize) {
     case 1024:
-        red_digits = 20;
+        red_digits = use_zmm ? 24 : 20;
         exp_digits = 16;
         break;
     case 1536:
