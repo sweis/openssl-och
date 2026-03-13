@@ -112,6 +112,19 @@ void ecp_nistz256_mul_mont(BN_ULONG res[P256_LIMBS],
 /* Montgomery sqr: res = a*a*2^-256 mod P */
 void ecp_nistz256_sqr_mont(BN_ULONG res[P256_LIMBS],
     const BN_ULONG a[P256_LIMBS]);
+#if defined(__x86_64) || defined(__x86_64__) || defined(_M_AMD64) || defined(_M_X64)
+/* Chained Montgomery sqr: res = a^(2^rep)*2^-256 mod P, rep >= 1 */
+void ecp_nistz256_sqr_mont_rep(BN_ULONG res[P256_LIMBS],
+    const BN_ULONG a[P256_LIMBS], BN_ULONG rep);
+#else
+static ossl_inline void ecp_nistz256_sqr_mont_rep(BN_ULONG res[P256_LIMBS],
+    const BN_ULONG a[P256_LIMBS], BN_ULONG rep)
+{
+    ecp_nistz256_sqr_mont(res, a);
+    while (--rep)
+        ecp_nistz256_sqr_mont(res, res);
+}
+#endif
 /* Convert a number from Montgomery domain, by multiplying with 1 */
 void ecp_nistz256_from_mont(BN_ULONG res[P256_LIMBS],
     const BN_ULONG in[P256_LIMBS]);
@@ -527,64 +540,44 @@ static void ecp_nistz256_mod_inverse(BN_ULONG r[P256_LIMBS],
     BN_ULONG p16[P256_LIMBS];
     BN_ULONG p32[P256_LIMBS];
     BN_ULONG res[P256_LIMBS];
-    int i;
 
     ecp_nistz256_sqr_mont(res, in);
     ecp_nistz256_mul_mont(p2, res, in); /* 3*p */
 
-    ecp_nistz256_sqr_mont(res, p2);
-    ecp_nistz256_sqr_mont(res, res);
+    ecp_nistz256_sqr_mont_rep(res, p2, 2);
     ecp_nistz256_mul_mont(p4, res, p2); /* f*p */
 
-    ecp_nistz256_sqr_mont(res, p4);
-    ecp_nistz256_sqr_mont(res, res);
-    ecp_nistz256_sqr_mont(res, res);
-    ecp_nistz256_sqr_mont(res, res);
+    ecp_nistz256_sqr_mont_rep(res, p4, 4);
     ecp_nistz256_mul_mont(p8, res, p4); /* ff*p */
 
-    ecp_nistz256_sqr_mont(res, p8);
-    for (i = 0; i < 7; i++)
-        ecp_nistz256_sqr_mont(res, res);
+    ecp_nistz256_sqr_mont_rep(res, p8, 8);
     ecp_nistz256_mul_mont(p16, res, p8); /* ffff*p */
 
-    ecp_nistz256_sqr_mont(res, p16);
-    for (i = 0; i < 15; i++)
-        ecp_nistz256_sqr_mont(res, res);
+    ecp_nistz256_sqr_mont_rep(res, p16, 16);
     ecp_nistz256_mul_mont(p32, res, p16); /* ffffffff*p */
 
-    ecp_nistz256_sqr_mont(res, p32);
-    for (i = 0; i < 31; i++)
-        ecp_nistz256_sqr_mont(res, res);
+    ecp_nistz256_sqr_mont_rep(res, p32, 32);
     ecp_nistz256_mul_mont(res, res, in);
 
-    for (i = 0; i < 32 * 4; i++)
-        ecp_nistz256_sqr_mont(res, res);
+    ecp_nistz256_sqr_mont_rep(res, res, 32 * 4);
     ecp_nistz256_mul_mont(res, res, p32);
 
-    for (i = 0; i < 32; i++)
-        ecp_nistz256_sqr_mont(res, res);
+    ecp_nistz256_sqr_mont_rep(res, res, 32);
     ecp_nistz256_mul_mont(res, res, p32);
 
-    for (i = 0; i < 16; i++)
-        ecp_nistz256_sqr_mont(res, res);
+    ecp_nistz256_sqr_mont_rep(res, res, 16);
     ecp_nistz256_mul_mont(res, res, p16);
 
-    for (i = 0; i < 8; i++)
-        ecp_nistz256_sqr_mont(res, res);
+    ecp_nistz256_sqr_mont_rep(res, res, 8);
     ecp_nistz256_mul_mont(res, res, p8);
 
-    ecp_nistz256_sqr_mont(res, res);
-    ecp_nistz256_sqr_mont(res, res);
-    ecp_nistz256_sqr_mont(res, res);
-    ecp_nistz256_sqr_mont(res, res);
+    ecp_nistz256_sqr_mont_rep(res, res, 4);
     ecp_nistz256_mul_mont(res, res, p4);
 
-    ecp_nistz256_sqr_mont(res, res);
-    ecp_nistz256_sqr_mont(res, res);
+    ecp_nistz256_sqr_mont_rep(res, res, 2);
     ecp_nistz256_mul_mont(res, res, p2);
 
-    ecp_nistz256_sqr_mont(res, res);
-    ecp_nistz256_sqr_mont(res, res);
+    ecp_nistz256_sqr_mont_rep(res, res, 2);
     ecp_nistz256_mul_mont(res, res, in);
 
     memcpy(r, res, sizeof(res));
@@ -1233,6 +1226,165 @@ void EC_nistz256_pre_comp_free(NISTZ256_PRE_COMP *pre)
     OPENSSL_free(pre);
 }
 
+/*
+ * ECDSA verify for P-256 that skips the Jacobian-to-affine inversion.
+ *
+ * After computing R = u1*G + u2*Q in Jacobian (X,Y,Z), the usual flow inverts
+ * Z (~255 squarings via Fermat) to recover x_affine = X/Z^2, then reduces mod
+ * n and compares with r. Since the check x_affine == r (mod n) is equivalent
+ * to X == r * Z^2 (mod p), with a rare fallback at r+n, we can avoid the
+ * inverse entirely with three Montgomery multiplications.
+ */
+static int ecp_nistz256_ecdsa_verify_sig(const unsigned char *dgst, int dgst_len,
+    const ECDSA_SIG *sig, EC_KEY *eckey)
+{
+    /* P-256 group order */
+    static const BN_ULONG ORD[P256_LIMBS] = {
+        TOBN(0xf3b9cac2, 0xfc632551), TOBN(0xbce6faad, 0xa7179e84),
+        TOBN(0xffffffff, 0xffffffff), TOBN(0xffffffff, 0x00000000)
+    };
+    int ret = -1, i;
+    BN_CTX *ctx;
+    const BIGNUM *order;
+    BIGNUM *u1, *u2, *m;
+    EC_POINT *point = NULL;
+    const EC_GROUP *group;
+    const EC_POINT *pub_key;
+    BN_ULONG X[P256_LIMBS], Z[P256_LIMBS], Z2[P256_LIMBS];
+    BN_ULONG r_fe[P256_LIMBS], r_mont[P256_LIMBS], t[P256_LIMBS];
+    BN_ULONG z_zero;
+
+    if (eckey == NULL || (group = EC_KEY_get0_group(eckey)) == NULL
+            || (pub_key = EC_KEY_get0_public_key(eckey)) == NULL || sig == NULL) {
+        ERR_raise(ERR_LIB_EC, EC_R_MISSING_PARAMETERS);
+        return -1;
+    }
+
+    if (!EC_KEY_can_sign(eckey)) {
+        ERR_raise(ERR_LIB_EC, EC_R_CURVE_DOES_NOT_SUPPORT_SIGNING);
+        return -1;
+    }
+
+    ctx = BN_CTX_new_ex(eckey->libctx);
+    if (ctx == NULL) {
+        ERR_raise(ERR_LIB_EC, ERR_R_BN_LIB);
+        return -1;
+    }
+    BN_CTX_start(ctx);
+    u1 = BN_CTX_get(ctx);
+    u2 = BN_CTX_get(ctx);
+    m  = BN_CTX_get(ctx);
+    if (m == NULL) {
+        ERR_raise(ERR_LIB_EC, ERR_R_BN_LIB);
+        goto err;
+    }
+
+    order = EC_GROUP_get0_order(group);
+    if (order == NULL) {
+        ERR_raise(ERR_LIB_EC, ERR_R_EC_LIB);
+        goto err;
+    }
+
+    if (BN_is_zero(sig->r) || BN_is_negative(sig->r) || BN_ucmp(sig->r, order) >= 0
+            || BN_is_zero(sig->s) || BN_is_negative(sig->s) || BN_ucmp(sig->s, order) >= 0) {
+        ERR_raise(ERR_LIB_EC, EC_R_BAD_SIGNATURE);
+        ret = 0;
+        goto err;
+    }
+
+    if (!ossl_ec_group_do_inverse_ord(group, u2, sig->s, ctx)) {
+        ERR_raise(ERR_LIB_EC, ERR_R_BN_LIB);
+        goto err;
+    }
+
+    i = BN_num_bits(order);
+    if (8 * dgst_len > i)
+        dgst_len = (i + 7) / 8;
+    if (!BN_bin2bn(dgst, dgst_len, m)) {
+        ERR_raise(ERR_LIB_EC, ERR_R_BN_LIB);
+        goto err;
+    }
+    if ((8 * dgst_len > i) && !BN_rshift(m, m, 8 - (i & 0x7))) {
+        ERR_raise(ERR_LIB_EC, ERR_R_BN_LIB);
+        goto err;
+    }
+
+    if (!BN_mod_mul(u1, m, u2, order, ctx)) {
+        ERR_raise(ERR_LIB_EC, ERR_R_BN_LIB);
+        goto err;
+    }
+    if (!BN_mod_mul(u2, sig->r, u2, order, ctx)) {
+        ERR_raise(ERR_LIB_EC, ERR_R_BN_LIB);
+        goto err;
+    }
+
+    if ((point = EC_POINT_new(group)) == NULL) {
+        ERR_raise(ERR_LIB_EC, ERR_R_EC_LIB);
+        goto err;
+    }
+    if (!EC_POINT_mul(group, point, u1, pub_key, u2, ctx)) {
+        ERR_raise(ERR_LIB_EC, ERR_R_EC_LIB);
+        goto err;
+    }
+
+    /*
+     * point->{X,Z} are the Montgomery-form Jacobian coordinates. Infinity is
+     * encoded as Z == 0; reject it (signature invalid) rather than falling
+     * through to a degenerate 0 == 0 match.
+     */
+    if (!ecp_nistz256_bignum_to_field_elem(X, point->X)
+            || !ecp_nistz256_bignum_to_field_elem(Z, point->Z)
+            || !ecp_nistz256_bignum_to_field_elem(r_fe, sig->r)) {
+        ERR_raise(ERR_LIB_EC, EC_R_COORDINATES_OUT_OF_RANGE);
+        goto err;
+    }
+
+    z_zero = Z[0] | Z[1] | Z[2] | Z[3];
+    if (z_zero == 0) {
+        ret = 0;
+        goto err;
+    }
+
+    ecp_nistz256_to_mont(r_mont, r_fe);
+    ecp_nistz256_sqr_mont(Z2, Z);
+    ecp_nistz256_mul_mont(t, r_mont, Z2);
+
+    if (is_equal(t, X)) {
+        ret = 1;
+        goto err;
+    }
+
+    /*
+     * Affine x is in [0,p) but r is in [1,n). If x >= n then r = x - n, and
+     * we must also try r+n. This is only possible when r+n < p, i.e.
+     * r < p-n ~ 2^127; the two high limbs of r must be zero and the low two
+     * must be below the corresponding limbs of p-n. Operands are public so
+     * a data-dependent branch is fine.
+     */
+    if (r_fe[3] == 0 && r_fe[2] == 0
+            && (r_fe[1] < TOBN(0x43190552, 0x58e8617b)
+                || (r_fe[1] == TOBN(0x43190552, 0x58e8617b)
+                    && r_fe[0] < TOBN(0x0c46353d, 0x039cdaae)))) {
+        BN_ULONG sum[P256_LIMBS];
+        /* r < p-n bounds r_fe[1] such that sum[1] cannot carry. */
+        sum[0] = r_fe[0] + ORD[0];
+        sum[1] = r_fe[1] + ORD[1] + (sum[0] < r_fe[0]);
+        sum[2] = ORD[2];
+        sum[3] = ORD[3];
+        ecp_nistz256_to_mont(r_mont, sum);
+        ecp_nistz256_mul_mont(t, r_mont, Z2);
+        ret = is_equal(t, X);
+        goto err;
+    }
+
+    ret = 0;
+err:
+    BN_CTX_end(ctx);
+    BN_CTX_free(ctx);
+    EC_POINT_free(point);
+    return ret;
+}
+
 static int ecp_nistz256_window_have_precompute_mult(const EC_GROUP *group)
 {
     /* There is a hard-coded table for the default generator. */
@@ -1617,7 +1769,7 @@ const EC_METHOD *EC_GFp_nistz256_method(void)
         ossl_ecdh_simple_compute_key,
         ossl_ecdsa_simple_sign_setup,
         ossl_ecdsa_simple_sign_sig,
-        ossl_ecdsa_simple_verify_sig,
+        ecp_nistz256_ecdsa_verify_sig,
         ecp_nistz256_inv_mod_ord, /* can be #define-d NULL */
         0, /* blind_coordinates */
         0, /* ladder_pre */
