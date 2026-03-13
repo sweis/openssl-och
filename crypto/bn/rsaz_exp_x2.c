@@ -109,6 +109,17 @@ void ossl_extract_multiplier_2x40_win5(BN_ULONG *red_Y,
     const BN_ULONG *red_table,
     int red_table_idx1, int red_table_idx2);
 
+/*
+ * ZMM variants for 2048-bit: 5 ZMM = 40 lanes exact, same 40-qword memory
+ * layout as the YMM path.
+ */
+void ossl_rsaz_amm52x40_x1_ifma512(BN_ULONG *res, const BN_ULONG *a,
+    const BN_ULONG *b, const BN_ULONG *m,
+    BN_ULONG k0);
+void ossl_rsaz_amm52x40_x2_ifma512(BN_ULONG *out, const BN_ULONG *a,
+    const BN_ULONG *b, const BN_ULONG *m,
+    const BN_ULONG k0[2]);
+
 void ossl_rsaz_amm52x20_x1_avxifma256(BN_ULONG *res, const BN_ULONG *a,
     const BN_ULONG *b, const BN_ULONG *m,
     BN_ULONG k0);
@@ -151,7 +162,7 @@ static AMM ossl_rsaz_amm52_x1[] = {
     ossl_rsaz_amm52x30_x1_avxifma256,
     ossl_rsaz_amm52x30_x1_ifma256,
     ossl_rsaz_amm52x40_x1_avxifma256,
-    ossl_rsaz_amm52x40_x1_ifma256,
+    ossl_rsaz_amm52x40_x1_ifma512,
 };
 
 typedef void (*DAMM)(BN_ULONG *res, const BN_ULONG *a, const BN_ULONG *b,
@@ -163,7 +174,7 @@ static DAMM ossl_rsaz_amm52_x2[] = {
     ossl_rsaz_amm52x30_x2_avxifma256,
     ossl_rsaz_amm52x30_x2_ifma256,
     ossl_rsaz_amm52x40_x2_avxifma256,
-    ossl_rsaz_amm52x40_x2_ifma256,
+    ossl_rsaz_amm52x40_x2_ifma512,
 };
 
 typedef void (*DEXTRACT)(BN_ULONG *res, const BN_ULONG *red_table,

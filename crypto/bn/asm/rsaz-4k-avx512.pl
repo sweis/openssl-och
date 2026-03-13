@@ -797,6 +797,358 @@ $code.=<<___;
 ___
 }
 
+###############################################################################
+# ZMM dual AMM for 40-digit number in radix 2^52.
+#
+# 40 lanes = 5 ZMM exactly (no padding). Data layout is identical to the YMM
+# path, so the caller does not need to change strides.
+#
+# The YMM x2 loop has 80 IFMA + 20 valignq per iteration. On Sapphire Rapids
+# YMM vpmadd52 dispatches to ports {0,1,5}: at 3/cycle the 80 IFMA ops push
+# ~27 ops onto port 5, which already needs 20 cycles for valignq, giving a
+# ~47-cycle port-5 bound. ZMM halves both counts, and its narrower port set
+# pulls IFMA off port 5, dropping the iteration to the ~19-cycle dep-chain
+# floor.
+#
+# void ossl_rsaz_amm52x40_x1_ifma512(BN_ULONG res[40],
+#                                    const BN_ULONG a[40],
+#                                    const BN_ULONG b[40],
+#                                    const BN_ULONG m[40],
+#                                    BN_ULONG k0);
+# void ossl_rsaz_amm52x40_x2_ifma512(BN_ULONG out[2][40],
+#                                    const BN_ULONG a[2][40],
+#                                    const BN_ULONG b[2][40],
+#                                    const BN_ULONG m[2][40],
+#                                    const BN_ULONG k0[2]);
+###############################################################################
+{
+my ($res,$a,$b,$m,$k0) = @_6_args_universal_ABI;
+
+my $mask52 = "%rax";
+my $acc_A  = "%r9";
+my $acc_B  = "%r15";
+my $b_ptr  = "%r11";
+my $iter   = "%ebx";
+
+my $zzero = "%zmm0";
+my ($BiA,$YiA,$BiB,$YiB) = ("%zmm1","%zmm2","%zmm3","%zmm4");
+my ($ZA0,$ZA1,$ZA2,$ZA3,$ZA4) = map("%zmm$_",(5..9));
+my ($ZB0,$ZB1,$ZB2,$ZB3,$ZB4) = map("%zmm$_",(10..14));
+my $ZA0_xmm = "%xmm5";
+my $ZB0_xmm = "%xmm10";
+
+my ($T0,$T1,$T2,$T3,$T4) = map("%zmm$_",(16..20));
+my $Mask52 = "%zmm21";
+
+my $OFF_B = 40*8;
+
+sub amm52x40_zmm {
+my ($_off, $_acc, $_Bi, $_Yi, $_Z0, $_Z1, $_Z2, $_Z3, $_Z4, $_Z0x, $_k0) = @_;
+$code.=<<___;
+    movq    $_off($b_ptr), %r13
+    vpbroadcastq    %r13, $_Bi
+    movq    $_off($a), %rdx
+    mulx    %r13, %r13, %r12
+    addq    %r13, $_acc
+    movq    %r12, %r10
+    adcq    \$0, %r10
+    movq    $_k0, %r13
+    imulq   $_acc, %r13
+    andq    $mask52, %r13
+    vpbroadcastq    %r13, $_Yi
+    movq    $_off($m), %rdx
+    mulx    %r13, %r13, %r12
+    addq    %r13, $_acc
+    adcq    %r12, %r10
+    shrq    \$52, $_acc
+    salq    \$12, %r10
+    or      %r10, $_acc
+
+    vpmadd52luq `$_off+64*0`($a), $_Bi, $_Z0
+    vpmadd52luq `$_off+64*1`($a), $_Bi, $_Z1
+    vpmadd52luq `$_off+64*2`($a), $_Bi, $_Z2
+    vpmadd52luq `$_off+64*3`($a), $_Bi, $_Z3
+    vpmadd52luq `$_off+64*4`($a), $_Bi, $_Z4
+    vpmadd52luq `$_off+64*0`($m), $_Yi, $_Z0
+    vpmadd52luq `$_off+64*1`($m), $_Yi, $_Z1
+    vpmadd52luq `$_off+64*2`($m), $_Yi, $_Z2
+    vpmadd52luq `$_off+64*3`($m), $_Yi, $_Z3
+    vpmadd52luq `$_off+64*4`($m), $_Yi, $_Z4
+    valignq \$1, $_Z0, $_Z1, $_Z0
+    valignq \$1, $_Z1, $_Z2, $_Z1
+    valignq \$1, $_Z2, $_Z3, $_Z2
+    valignq \$1, $_Z3, $_Z4, $_Z3
+    valignq \$1, $_Z4, $zzero, $_Z4
+    vmovq   $_Z0x, %r13
+    addq    %r13, $_acc
+    vpmadd52huq `$_off+64*0`($a), $_Bi, $_Z0
+    vpmadd52huq `$_off+64*1`($a), $_Bi, $_Z1
+    vpmadd52huq `$_off+64*2`($a), $_Bi, $_Z2
+    vpmadd52huq `$_off+64*3`($a), $_Bi, $_Z3
+    vpmadd52huq `$_off+64*4`($a), $_Bi, $_Z4
+    vpmadd52huq `$_off+64*0`($m), $_Yi, $_Z0
+    vpmadd52huq `$_off+64*1`($m), $_Yi, $_Z1
+    vpmadd52huq `$_off+64*2`($m), $_Yi, $_Z2
+    vpmadd52huq `$_off+64*3`($m), $_Yi, $_Z3
+    vpmadd52huq `$_off+64*4`($m), $_Yi, $_Z4
+___
+}
+
+# Normalization for 5 ZMM (40 lanes). Carry mask is 5*8 = 40 bits, fits in a
+# 64-bit GPR.
+sub norm52x40_zmm {
+my ($_acc, $_Z0, $_Z1, $_Z2, $_Z3, $_Z4, $_out_off) = @_;
+$code.=<<___;
+    mov     \$1, %ecx
+    kmovb   %ecx, %k1
+    vpbroadcastq    $_acc, ${_Z0}{%k1}
+
+    vpsrlq    \$52, $_Z0, $T0
+    vpsrlq    \$52, $_Z1, $T1
+    vpsrlq    \$52, $_Z2, $T2
+    vpsrlq    \$52, $_Z3, $T3
+    vpsrlq    \$52, $_Z4, $T4
+
+    valignq   \$7, $T3, $T4, $T4
+    valignq   \$7, $T2, $T3, $T3
+    valignq   \$7, $T1, $T2, $T2
+    valignq   \$7, $T0, $T1, $T1
+    valignq   \$7, $zzero, $T0, $T0
+
+    vpandq    $Mask52, $_Z0, $_Z0
+    vpandq    $Mask52, $_Z1, $_Z1
+    vpandq    $Mask52, $_Z2, $_Z2
+    vpandq    $Mask52, $_Z3, $_Z3
+    vpandq    $Mask52, $_Z4, $_Z4
+
+    vpaddq    $T0, $_Z0, $_Z0
+    vpaddq    $T1, $_Z1, $_Z1
+    vpaddq    $T2, $_Z2, $_Z2
+    vpaddq    $T3, $_Z3, $_Z3
+    vpaddq    $T4, $_Z4, $_Z4
+
+    vpcmpuq   \$6, $Mask52, $_Z0, %k1
+    vpcmpuq   \$6, $Mask52, $_Z1, %k2
+    vpcmpuq   \$6, $Mask52, $_Z2, %k3
+    vpcmpuq   \$6, $Mask52, $_Z3, %k4
+    vpcmpuq   \$6, $Mask52, $_Z4, %k5
+    kmovb   %k1, %r14d
+    kmovb   %k2, %r13d
+    kmovb   %k3, %r12d
+    kmovb   %k4, %r11d
+    kmovb   %k5, %r10d
+
+    vpcmpuq   \$0, $Mask52, $_Z0, %k1
+    vpcmpuq   \$0, $Mask52, $_Z1, %k2
+    vpcmpuq   \$0, $Mask52, $_Z2, %k3
+    vpcmpuq   \$0, $Mask52, $_Z3, %k4
+    vpcmpuq   \$0, $Mask52, $_Z4, %k5
+    kmovb   %k1, %r9d
+    kmovb   %k2, %r8d
+    kmovb   %k3, %edx
+    kmovb   %k4, %ecx
+    kmovb   %k5, %ebp
+
+    # Assemble 40-bit overflow and saturated vectors in 64-bit GPRs.
+    shl   \$8,  %r13
+    shl   \$16, %r12
+    shl   \$24, %r11
+    shl   \$32, %r10
+    or    %r13, %r14
+    or    %r12, %r14
+    or    %r11, %r14
+    or    %r10, %r14    # r14 = overflow[0..39]
+    shl   \$8,  %r8
+    shl   \$16, %rdx
+    shl   \$24, %rcx
+    shl   \$32, %rbp
+    or    %r8,  %r9
+    or    %rdx, %r9
+    or    %rcx, %r9
+    or    %rbp, %r9     # r9 = saturated[0..39]
+
+    add   %r14, %r14
+    add   %r9,  %r14
+    xor   %r9,  %r14
+
+    kmovb   %r14d, %k1
+    shr     \$8, %r14
+    kmovb   %r14d, %k2
+    shr     \$8, %r14
+    kmovb   %r14d, %k3
+    shr     \$8, %r14
+    kmovb   %r14d, %k4
+    shr     \$8, %r14
+    kmovb   %r14d, %k5
+
+    vpsubq  $Mask52, $_Z0, ${_Z0}{%k1}
+    vpsubq  $Mask52, $_Z1, ${_Z1}{%k2}
+    vpsubq  $Mask52, $_Z2, ${_Z2}{%k3}
+    vpsubq  $Mask52, $_Z3, ${_Z3}{%k4}
+    vpsubq  $Mask52, $_Z4, ${_Z4}{%k5}
+
+    vpandq  $Mask52, $_Z0, $_Z0
+    vpandq  $Mask52, $_Z1, $_Z1
+    vpandq  $Mask52, $_Z2, $_Z2
+    vpandq  $Mask52, $_Z3, $_Z3
+    vpandq  $Mask52, $_Z4, $_Z4
+
+    vmovdqu64   $_Z0, `$_out_off+64*0`($res)
+    vmovdqu64   $_Z1, `$_out_off+64*1`($res)
+    vmovdqu64   $_Z2, `$_out_off+64*2`($res)
+    vmovdqu64   $_Z3, `$_out_off+64*3`($res)
+    vmovdqu64   $_Z4, `$_out_off+64*4`($res)
+___
+}
+
+$code.=<<___;
+.text
+
+.globl  ossl_rsaz_amm52x40_x1_ifma512
+.type   ossl_rsaz_amm52x40_x1_ifma512,\@function,5
+.align 32
+ossl_rsaz_amm52x40_x1_ifma512:
+.cfi_startproc
+    endbranch
+    push    %rbx
+.cfi_push   %rbx
+    push    %rbp
+.cfi_push   %rbp
+    push    %r12
+.cfi_push   %r12
+    push    %r13
+.cfi_push   %r13
+    push    %r14
+.cfi_push   %r14
+    push    %r15
+.cfi_push   %r15
+.Lossl_rsaz_amm52x40_x1_ifma512_body:
+
+    vpxord   $zzero, $zzero, $zzero
+    vmovdqa64   $zzero, $ZA0
+    vmovdqa64   $zzero, $ZA1
+    vmovdqa64   $zzero, $ZA2
+    vmovdqa64   $zzero, $ZA3
+    vmovdqa64   $zzero, $ZA4
+
+    xorl    %r9d, %r9d
+
+    movq    $b, $b_ptr
+    movq    \$0xfffffffffffff, $mask52
+    movq    $k0, %r14       # k0 is a value; preserve across the loop
+
+    mov     \$40, $iter
+
+.align 32
+.Lloop40_zmm_x1:
+___
+    &amm52x40_zmm(0, $acc_A, $BiA, $YiA, $ZA0, $ZA1, $ZA2, $ZA3, $ZA4, $ZA0_xmm, "%r14");
+$code.=<<___;
+    lea     8($b_ptr), $b_ptr
+    dec     $iter
+    jne     .Lloop40_zmm_x1
+
+    vpbroadcastq .Lmask52x4(%rip), $Mask52
+___
+    &norm52x40_zmm($acc_A, $ZA0, $ZA1, $ZA2, $ZA3, $ZA4, 0);
+$code.=<<___;
+    vzeroupper
+    mov  0(%rsp),%r15
+.cfi_restore    %r15
+    mov  8(%rsp),%r14
+.cfi_restore    %r14
+    mov  16(%rsp),%r13
+.cfi_restore    %r13
+    mov  24(%rsp),%r12
+.cfi_restore    %r12
+    mov  32(%rsp),%rbp
+.cfi_restore    %rbp
+    mov  40(%rsp),%rbx
+.cfi_restore    %rbx
+    lea  48(%rsp),%rsp
+.cfi_adjust_cfa_offset  -48
+.Lossl_rsaz_amm52x40_x1_ifma512_epilogue:
+    ret
+.cfi_endproc
+.size   ossl_rsaz_amm52x40_x1_ifma512, .-ossl_rsaz_amm52x40_x1_ifma512
+
+.globl  ossl_rsaz_amm52x40_x2_ifma512
+.type   ossl_rsaz_amm52x40_x2_ifma512,\@function,5
+.align 32
+ossl_rsaz_amm52x40_x2_ifma512:
+.cfi_startproc
+    endbranch
+    push    %rbx
+.cfi_push   %rbx
+    push    %rbp
+.cfi_push   %rbp
+    push    %r12
+.cfi_push   %r12
+    push    %r13
+.cfi_push   %r13
+    push    %r14
+.cfi_push   %r14
+    push    %r15
+.cfi_push   %r15
+.Lossl_rsaz_amm52x40_x2_ifma512_body:
+
+    vpxord   $zzero, $zzero, $zzero
+    vmovdqa64   $zzero, $ZA0
+    vmovdqa64   $zzero, $ZA1
+    vmovdqa64   $zzero, $ZA2
+    vmovdqa64   $zzero, $ZA3
+    vmovdqa64   $zzero, $ZA4
+    vmovdqa64   $zzero, $ZB0
+    vmovdqa64   $zzero, $ZB1
+    vmovdqa64   $zzero, $ZB2
+    vmovdqa64   $zzero, $ZB3
+    vmovdqa64   $zzero, $ZB4
+
+    xorl    %r9d, %r9d
+    xorl    %r15d, %r15d
+
+    movq    $b, $b_ptr
+    movq    \$0xfffffffffffff, $mask52
+
+    mov     \$40, $iter
+
+.align 32
+.Lloop40_zmm:
+___
+    &amm52x40_zmm(0,      $acc_A, $BiA, $YiA, $ZA0, $ZA1, $ZA2, $ZA3, $ZA4, $ZA0_xmm, "($k0)");
+    &amm52x40_zmm($OFF_B, $acc_B, $BiB, $YiB, $ZB0, $ZB1, $ZB2, $ZB3, $ZB4, $ZB0_xmm, "8($k0)");
+$code.=<<___;
+    lea     8($b_ptr), $b_ptr
+    dec     $iter
+    jne     .Lloop40_zmm
+
+    vpbroadcastq .Lmask52x4(%rip), $Mask52
+___
+    &norm52x40_zmm($acc_A, $ZA0, $ZA1, $ZA2, $ZA3, $ZA4, 0);
+    &norm52x40_zmm($acc_B, $ZB0, $ZB1, $ZB2, $ZB3, $ZB4, $OFF_B);
+$code.=<<___;
+    vzeroupper
+    mov  0(%rsp),%r15
+.cfi_restore    %r15
+    mov  8(%rsp),%r14
+.cfi_restore    %r14
+    mov  16(%rsp),%r13
+.cfi_restore    %r13
+    mov  24(%rsp),%r12
+.cfi_restore    %r12
+    mov  32(%rsp),%rbp
+.cfi_restore    %rbp
+    mov  40(%rsp),%rbx
+.cfi_restore    %rbx
+    lea  48(%rsp),%rsp
+.cfi_adjust_cfa_offset  -48
+.Lossl_rsaz_amm52x40_x2_ifma512_epilogue:
+    ret
+.cfi_endproc
+.size   ossl_rsaz_amm52x40_x2_ifma512, .-ossl_rsaz_amm52x40_x2_ifma512
+___
+}
+
 if ($win64) {
 $rec="%rcx";
 $frame="%rdx";
