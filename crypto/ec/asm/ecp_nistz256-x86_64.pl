@@ -1973,6 +1973,110 @@ $code.=<<___;
 .cfi_endproc
 .size	ecp_nistz256_sqr_mont,.-ecp_nistz256_sqr_mont
 
+################################################################################
+# void ecp_nistz256_sqr_mont_rep(uint64_t res[4], const uint64_t a[4], uint64_t rep);
+#
+# Computes rep chained squarings res = a^(2^rep) in one call, amortizing the
+# function prologue/epilogue and dispatch check. ord_sqr_mont already does
+# this; the field-prime path did not, and mod_inverse calls sqr_mont ~250
+# times in tight C loops.
+.globl	ecp_nistz256_sqr_mont_rep
+.type	ecp_nistz256_sqr_mont_rep,\@function,3
+.align	32
+ecp_nistz256_sqr_mont_rep:
+.cfi_startproc
+___
+$code.=<<___	if ($addx);
+	mov	\$0x80100, %ecx
+	and	OPENSSL_ia32cap_P+8(%rip), %ecx
+___
+$code.=<<___;
+	push	%rbp
+.cfi_push	%rbp
+	push	%rbx
+.cfi_push	%rbx
+	push	%r12
+.cfi_push	%r12
+	push	%r13
+.cfi_push	%r13
+	push	%r14
+.cfi_push	%r14
+	push	%r15
+.cfi_push	%r15
+.Lsqr_rep_body:
+___
+$code.=<<___	if ($addx);
+	cmp	\$0x80100, %ecx
+	je	.Lsqr_rep_x
+
+___
+$code.=<<___;
+	mov	$b_org, %rbx		# rep counter (3rd arg, %rdx, gets clobbered)
+	mov	8*0($a_ptr), %rax
+	mov	8*1($a_ptr), $acc6
+	mov	8*2($a_ptr), $acc7
+	mov	8*3($a_ptr), $acc0
+	jmp	.Loop_sqr_rep_q
+
+.align	32
+.Loop_sqr_rep_q:
+	call	__ecp_nistz256_sqr_montq
+	# output in $acc4..$acc7, also stored at ($r_ptr); %rsi clobbered
+	mov	$acc7, $acc0		# feed result back as input
+	mov	$acc6, $acc7
+	mov	$acc5, $acc6
+	mov	$acc4, %rax
+	mov	$r_ptr, $a_ptr		# sqr_montq re-reads a[] from ($a_ptr)
+	dec	%rbx
+	jnz	.Loop_sqr_rep_q
+___
+$code.=<<___	if ($addx);
+	jmp	.Lsqr_rep_done
+
+.align	32
+.Lsqr_rep_x:
+	mov	$b_org, %rbx		# rep counter
+	mov	8*0($a_ptr), %rdx
+	mov	8*1($a_ptr), $acc6
+	mov	8*2($a_ptr), $acc7
+	mov	8*3($a_ptr), $acc0
+	lea	-128($a_ptr), $a_ptr
+	jmp	.Loop_sqr_rep_x
+
+.align	32
+.Loop_sqr_rep_x:
+	call	__ecp_nistz256_sqr_montx
+	# output in $acc4..$acc7, also stored at ($r_ptr); %rsi clobbered
+	mov	$acc7, $acc0		# feed result back as input
+	mov	$acc6, $acc7
+	mov	$acc5, $acc6
+	mov	$acc4, %rdx
+	lea	-128($r_ptr), $a_ptr	# sqr_montx re-reads a[] from 128($a_ptr)
+	dec	%rbx
+	jnz	.Loop_sqr_rep_x
+
+.Lsqr_rep_done:
+___
+$code.=<<___;
+	mov	0(%rsp),%r15
+.cfi_restore	%r15
+	mov	8(%rsp),%r14
+.cfi_restore	%r14
+	mov	16(%rsp),%r13
+.cfi_restore	%r13
+	mov	24(%rsp),%r12
+.cfi_restore	%r12
+	mov	32(%rsp),%rbx
+.cfi_restore	%rbx
+	mov	40(%rsp),%rbp
+.cfi_restore	%rbp
+	lea	48(%rsp),%rsp
+.cfi_adjust_cfa_offset	-48
+.Lsqr_rep_epilogue:
+	ret
+.cfi_endproc
+.size	ecp_nistz256_sqr_mont_rep,.-ecp_nistz256_sqr_mont_rep
+
 .type	__ecp_nistz256_sqr_montq,\@abi-omnipotent
 .align	32
 __ecp_nistz256_sqr_montq:
@@ -2718,6 +2822,8 @@ ecp_nistz256_gather_w7:
 ___
 $code.=<<___	if ($avx>1);
 	mov	OPENSSL_ia32cap_P+8(%rip), %eax
+	test	\$`1<<16`, %eax		# AVX512F
+	jnz	.Lavx512_gather_w7
 	test	\$`1<<5`, %eax
 	jnz	.Lavx2_gather_w7
 ___
@@ -3024,6 +3130,59 @@ $code.=<<___;
 .LSEH_end_ecp_nistz256_avx2_gather_w7:
 .size	ecp_nistz256_avx2_gather_w7,.-ecp_nistz256_avx2_gather_w7
 ___
+}
+################################################################################
+# AVX-512 constant-time gather. One ZMM = one 64-byte affine point, so a single
+# masked load per entry replaces the two-YMM load/and/xor sequence. Port 5
+# (vpcmpeqd) is the main bound at ~1 compare/cycle.
+{
+my ($val,$in_t,$index)=$win64?("%rcx","%rdx","%r8d"):("%rdi","%rsi","%edx");
+
+$code.=<<___;
+.type	ecp_nistz256_avx512_gather_w7,\@abi-omnipotent
+.align	32
+ecp_nistz256_avx512_gather_w7:
+.cfi_startproc
+.Lavx512_gather_w7:
+	vpbroadcastd	$index, %zmm0		# index broadcast to 16 dword lanes
+	vpxord		%zmm5, %zmm5, %zmm5	# accumulator
+	vpbroadcastd	.LOne(%rip), %zmm1	# counter = 1
+	vpaddd		%zmm1, %zmm1, %zmm2	# counter = 2
+	vpaddd		%zmm1, %zmm2, %zmm3	# counter = 3
+	vpaddd		%zmm2, %zmm2, %zmm10	# stride  = 4
+	vpaddd		%zmm2, %zmm2, %zmm4	# counter = 4
+
+	mov	\$16, %eax
+.Lselect_loop_avx512_w7:
+	vpcmpeqd	%zmm0, %zmm1, %k1	# all-ones mask iff counter==index
+	vpcmpeqd	%zmm0, %zmm2, %k2
+	vpcmpeqd	%zmm0, %zmm3, %k3
+	vpcmpeqd	%zmm0, %zmm4, %k4
+	vmovdqu64	64*0($in_t), %zmm6{%k1}{z}
+	vmovdqu64	64*1($in_t), %zmm7{%k2}{z}
+	vmovdqu64	64*2($in_t), %zmm8{%k3}{z}
+	vmovdqu64	64*3($in_t), %zmm9{%k4}{z}
+	vpaddd		%zmm10, %zmm1, %zmm1
+	vpaddd		%zmm10, %zmm2, %zmm2
+	vpaddd		%zmm10, %zmm3, %zmm3
+	vpaddd		%zmm10, %zmm4, %zmm4
+	vpord		%zmm6, %zmm5, %zmm5
+	vpord		%zmm7, %zmm5, %zmm5
+	vpord		%zmm8, %zmm5, %zmm5
+	vpord		%zmm9, %zmm5, %zmm5
+	lea		64*4($in_t), $in_t
+	dec		%eax
+	jnz		.Lselect_loop_avx512_w7
+
+	vmovdqu64	%zmm5, ($val)
+	vzeroupper
+	ret
+.cfi_endproc
+.size	ecp_nistz256_avx512_gather_w7,.-ecp_nistz256_avx512_gather_w7
+___
+}
+if ($avx>1) {
+    # avx2_gather_w7 already emitted above; swallow the else-branch ud2 stub.
 } else {
 $code.=<<___;
 .globl	ecp_nistz256_avx2_gather_w7
