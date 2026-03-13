@@ -70,3 +70,57 @@ expected margin since GCM = CTR + GHASH.
 - Differential test vs. `aesni_ctr32_encrypt_blocks` (reference):
   28 sizes × 3 key lengths × 3 IVs (including counter values near 2³²) = 252 cases, all identical
 - VAES enc → legacy dec round-trip: pass
+
+---
+
+## GCM investigation (no change committed)
+
+### Profile of `ossl_aes_gcm_encrypt_avx512` (perf cpu-clock, 4 kHz)
+
+| Category          | % cycles | Notes                                         |
+|-------------------|----------|-----------------------------------------------|
+| vaesenc(+last)    | 47.8     | 10 ops per block, port 0 only                 |
+| vpclmulqdq        |  9.4     | GHASH, port 5                                 |
+| vbroadcastf64x2   |  6.8     | 33 round-key loads per 48-block iteration     |
+| vpshufb           |  4.2     | byte-swap, port 5                             |
+| loads/stores/xor  | ~31      | data movement                                 |
+
+### Hypothesis tested: replace `vbroadcastf64x2` with aligned stack loads
+
+The 48-block inner loop reloads round keys from memory 33× via
+`vbroadcastf64x2` (load + port-5 shuffle). Register pressure is maxed (only
+zmm9/zmm23 free), so the only alternative is pre-replicating the 15 round
+keys into a 960 B stack region once at entry and reading them with
+`vmovdqa64` (load-only, no shuffle µop).
+
+**Result: no measurable change** (10-run interleaved A/B, 3 s/run):
+
+|         | median      | mean        | min–max               |
+|---------|-------------|-------------|-----------------------|
+| before  | 12764.2 MB/s| 12667.9 MB/s| 12353.8 – 12850.4 MB/s|
+| after   | 12619.8 MB/s| 12644.5 MB/s| 12247.1 – 12846.6 MB/s|
+
+Post-change profile showed `vbroadcastf64x2` at ~0% and `vmovdqa64` at 10.6%
+— the cycles reattributed one-for-one. The 6.8% on broadcasts was measuring
+**load latency**, not port-5 pressure.
+
+### Why GCM is already optimal on Sapphire Rapids
+
+Port-0 throughput ceiling (AES-128, ZMM, 1 op/cycle):
+
+    4 blocks / 10 AES ops × 2.1 GHz × 16 B = 13.44 GB/s
+
+Measured 12.67 GB/s = **94.3 % of the ceiling**. The `vbroadcastf64x2`
+instructions execute in the shadow of the vaesenc dependency chains
+(4-cycle latency × 10 rounds = 40-cycle critical path per 16-block chunk,
+plenty of slack to hide the 11 key loads). Port 5 is not the bottleneck.
+
+The existing `aes-gcm-avx512.pl` ping-pong key-load scheme
+(AESKEY1/AESKEY2 prefetching the next round while the current one runs)
+already extracts all available ILP.
+
+### Security note
+
+The tested change was reverted. Holding replicated key material in an
+extra 960 B stack region for zero performance gain is a small but strictly
+negative trade.
