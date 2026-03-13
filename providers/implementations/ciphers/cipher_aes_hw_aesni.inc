@@ -35,8 +35,14 @@ static int cipher_hw_aesni_initkey(PROV_CIPHER_CTX *dat,
         dat->block = (block128_f) aesni_encrypt;
         if (dat->mode == EVP_CIPH_CBC_MODE)
             dat->stream.cbc = (cbc128_f) aesni_cbc_encrypt;
-        else if (dat->mode == EVP_CIPH_CTR_MODE)
-            dat->stream.ctr = (ctr128_f) aesni_ctr32_encrypt_blocks;
+        else if (dat->mode == EVP_CIPH_CTR_MODE) {
+#if defined(__x86_64) || defined(__x86_64__) || defined(_M_AMD64) || defined(_M_X64)
+            if (ossl_aes_ctr32_vaes_eligible())
+                dat->stream.ctr = (ctr128_f) ossl_aes_ctr32_encrypt_blocks_vaes;
+            else
+#endif
+                dat->stream.ctr = (ctr128_f) aesni_ctr32_encrypt_blocks;
+        }
         else
             dat->stream.cbc = NULL;
     }

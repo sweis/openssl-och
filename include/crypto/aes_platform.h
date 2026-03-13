@@ -238,6 +238,12 @@ void aesni_ctr32_encrypt_blocks(const unsigned char *in,
     size_t blocks,
     const void *key, const unsigned char *ivec);
 
+int ossl_aes_ctr32_vaes_eligible(void);
+void ossl_aes_ctr32_encrypt_blocks_vaes(const unsigned char *in,
+    unsigned char *out,
+    size_t blocks,
+    const void *key, const unsigned char *ivec);
+
 void aesni_xts_encrypt(const unsigned char *in,
     unsigned char *out,
     size_t length,
